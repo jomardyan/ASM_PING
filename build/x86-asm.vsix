@@ -1,0 +1,1 @@
+{"$id":"1","innerException":null,"message":"Resource not found","typeName":"Microsoft.VisualStudio.Services.Gallery.WebApi.ExtensionAssetNotFoundException, Microsoft.VisualStudio.Services.Gallery.WebApi","typeKey":"ExtensionAssetNotFoundException","errorCode":0,"eventId":3000}

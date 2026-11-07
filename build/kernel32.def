@@ -1,0 +1,13 @@
+LIBRARY kernel32
+EXPORTS
+    GetStdHandle
+    WriteFile
+    ExitProcess
+    GetCommandLineA
+    GetLastError
+    Sleep
+    SetConsoleCtrlHandler
+    GetConsoleMode
+    SetConsoleMode
+    GetConsoleOutputCP
+    GetEnvironmentVariableA

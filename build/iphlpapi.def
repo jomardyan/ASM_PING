@@ -1,0 +1,5 @@
+LIBRARY iphlpapi
+EXPORTS
+    IcmpCreateFile
+    IcmpSendEcho
+    IcmpCloseHandle
