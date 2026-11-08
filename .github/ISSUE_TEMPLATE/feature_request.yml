@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a feature or improvement to the ping client.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: use_case
+    attributes:
+      label: What would you like to accomplish?
+      description: Describe your use case and the limitation in the current client.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include an example command or output if useful, and explain interactions with existing options.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or additional context
+      description: Describe any workaround or related behavior you have considered.

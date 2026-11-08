@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a reproducible problem with the Windows ping client.
+title: "[Bug]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the problem and the behavior you expected.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Release tag or commit hash; mention if you built from source.
+      placeholder: "v1.0.0 or git rev-parse --short HEAD"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: Include the Windows version and build number from winver.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps and command
+      description: Include the exact command and enough steps to reproduce the problem. Use loopback addresses where possible.
+      render: powershell
+      placeholder: '.\ping.exe -6 -n 1 ::1'
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Paste relevant output. Replace private addresses or hostnames before posting.
+      render: text
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Mention your terminal, output redirection, PING_PRETTY setting, or custom tool paths if relevant.

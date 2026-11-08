@@ -2,5 +2,6 @@ LIBRARY ws2_32
 EXPORTS
     WSAStartup
     WSACleanup
-    gethostbyname
-    gethostbyaddr
+    getaddrinfo
+    freeaddrinfo
+    getnameinfo

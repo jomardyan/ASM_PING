@@ -17,10 +17,18 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / 'ping.exe'
+BUILD_DIR = Path(os.environ.get('PING_TEST_BUILD_DIR', str(ROOT))).resolve()
+EXE = BUILD_DIR / 'ping.exe'
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 TIMESTAMP = re.compile(r'^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\] (.+)$',
                        re.MULTILINE)
+
+
+def application_source():
+    source = (ROOT / 'ping_win64.asm').read_text()
+    # Inline the resolver before replacing Win32 boundaries in the test build.
+    return source.replace('%include "net_resolve.asm"',
+                          (ROOT / 'net_resolve.asm').read_text())
 
 
 def run_ping(args, *, exe=EXE, pretty=None, mode=None):
@@ -64,6 +72,13 @@ class PingTests(unittest.TestCase):
     def setUpClass(cls):
         if sys.platform != 'win32':
             raise unittest.SkipTest('Windows x64 is required')
+        if not EXE.is_file():
+            raise RuntimeError(f'Build the application first with build.ps1: {EXE}')
+        nasm_version = json.loads((ROOT / 'build/nasm.json').read_text(encoding='utf-8'))['version']
+        cached_nasm = ROOT / '.ping-build' / 'tools' / ('nasm-' + nasm_version) / 'nasm.exe'
+        cls.nasm = os.environ.get('PING_TEST_NASM') or str(cached_nasm)
+        if not Path(cls.nasm).is_file():
+            raise RuntimeError('NASM not found. Run build.ps1 first or set PING_TEST_NASM.')
         cls.temp = tempfile.TemporaryDirectory(prefix='ping tests ')
         cls.addClassCleanup(cls.temp.cleanup)
         cls.work = Path(cls.temp.name)
@@ -76,11 +91,13 @@ class PingTests(unittest.TestCase):
                 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-find',
                 r'VC\Tools\MSVC\**\bin\Hostx64\x64\link.exe'], text=True).strip().splitlines()[0]
         cls.linker = linker
-        source = (ROOT / 'ping_win64.asm').read_text()
+        source = application_source()
         for name in ('GetConsoleMode', 'SetConsoleMode', 'GetConsoleOutputCP',
-                     'gethostbyname', 'gethostbyaddr', 'SetConsoleCtrlHandler',
-                     'GetLastError', 'GetSystemTime', 'IcmpCreateFile',
-                     'IcmpSendEcho2', 'IcmpCloseHandle', 'WriteFile'):
+                     'getaddrinfo', 'freeaddrinfo', 'getnameinfo',
+                     'SetConsoleCtrlHandler', 'GetLastError', 'GetSystemTime',
+                     'IcmpCreateFile', 'Icmp6CreateFile', 'IcmpSendEcho2',
+                     'IcmpSendEcho2Ex', 'Icmp6SendEcho2', 'IcmpCloseHandle',
+                     'CreateThread', 'WriteFile'):
             source = re.sub(r'\bcall\s+' + name + r'\b', 'call    test_' + name, source)
         source += '\n' + (ROOT / 'tests/winapi_stubs.asm').read_text()
         cls.assemble(source, cls.mock, 'main')
@@ -90,10 +107,10 @@ class PingTests(unittest.TestCase):
         asm = exe.with_suffix('.asm')
         obj = exe.with_suffix('.obj')
         asm.write_text(source, encoding='utf-8')
-        subprocess.run([str(ROOT / 'build/nasm-3.02/nasm.exe'), '-f', 'win64',
+        subprocess.run([cls.nasm, '-f', 'win64',
                         '-Wall', '-w-reloc', '-Werror', str(asm), '-o', str(obj)],
                        check=True, capture_output=True)
-        libs = [str(ROOT / '.ping-build' / (name + '.lib'))
+        libs = [str(BUILD_DIR / '.ping-build' / (name + '.lib'))
                 for name in ('kernel32', 'shell32', 'ws2_32', 'iphlpapi')]
         subprocess.run([cls.linker, '/nologo', '/machine:x64', '/subsystem:console',
                         '/entry:' + entry, '/nodefaultlib', '/out:' + str(exe),
@@ -120,6 +137,158 @@ class PingTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout)
         self.assertIn('Received = 1', p.stdout)
 
+    def test_ipv6_loopback_payload_bounds_and_implicit_family(self):
+        for size in (0, 32, 65500):
+            for family in ([], ['-6']):
+                with self.subTest(size=size, family=family):
+                    p = run_ping([*family, '-n1', '-l', str(size), '::1'])
+                    self.assertEqual(p.returncode, 0, p.stdout)
+                    self.assertIn(f'Reply from ::1: bytes={size}', p.stdout)
+                    self.assertIn('Sent = 1, Received = 1, Lost = 0 (0% loss)', p.stdout)
+                    self.assertNotIn('TTL=', p.stdout)
+
+    def test_ipv6_hostname_hop_limit_and_reverse_lookup(self):
+        for flags in (['-6'], ['-6', '-a'], ['-6', '-i64'], ['/6', '/i64']):
+            with self.subTest(flags=flags):
+                p = run_ping([*flags, '-n1', 'localhost'])
+                self.assertEqual(p.returncode, 0, p.stdout)
+                self.assertIn('::1', p.stdout)
+                self.assertIn('Received = 1', p.stdout)
+                self.assertNotIn('TTL=', p.stdout)
+        p = run_ping(['-n1', 'localhost'])
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn('127.0.0.1', p.stdout)
+
+    def test_source_selection_loopback_and_argument_forms(self):
+        cases = [(['-4', '-S', '127.0.0.1'], '127.0.0.1'),
+                 (['-S127.0.0.1'], 'localhost'),
+                 (['--source', '127.0.0.1'], '127.0.0.1'),
+                 (['-6', '-S', '::1'], '::1'),
+                 (['-S::1'], 'localhost'),
+                 (['--source', '::1'], '::1'),
+                 (['/S::1'], '::1'),
+                 (['-S', '::1%0'], '::1')]
+        for flags, target in cases:
+            with self.subTest(flags=flags, target=target):
+                p = run_ping([*flags, '-n1', target])
+                self.assertEqual(p.returncode, 0, p.stdout)
+                self.assertIn('Source', p.stdout)
+                self.assertIn('Sent = 1, Received = 1, Lost = 0 (0% loss)', p.stdout)
+                if '::1' in ' '.join(flags):
+                    self.assertNotIn('TTL=', p.stdout)
+                else:
+                    self.assertIn('TTL=', p.stdout)
+
+    def test_address_family_conflicts_and_ipv4_only_options(self):
+        for flags, target in [(['-4'], '::1'), (['-6'], '127.0.0.1'),
+                              (['-4', '-6'], '::1'), (['-6', '-4'], '127.0.0.1'),
+                              (['-4', '-S::1'], '127.0.0.1'),
+                              (['-6', '-S127.0.0.1'], '::1'),
+                              (['-S127.0.0.1'], '::1'),
+                              (['-S::1'], '127.0.0.1')]:
+            with self.subTest(flags=flags, target=target):
+                p = run_ping([*flags, '-n1', target])
+                self.assertEqual(p.returncode, 2, p.stdout)
+                self.assertNotIn('Reply from ', p.stdout)
+        for option in ('-f', '-r1', '-v0', '-v255'):
+            for family in ([], ['-6']):
+                with self.subTest(option=option, family=family):
+                    p = run_ping([*family, option, '-n1', '::1'])
+                    self.assertEqual(p.returncode, 2, p.stdout)
+                    self.assertIn('IPv4', p.stdout)
+
+    def test_source_requires_numeric_address_and_valid_scope(self):
+        for source in ('', 'localhost', 'example.test', 'bad host', '::gg',
+                       '127.0.0.1x', '::1%not-an-index', '1:2:3:4:5:6:7:8:9',
+                       '::1%', '::1%4294967296', '::1%1%2', '127.0.0.1%1',
+                       '\x1b[31m', 'h\u00f4st', 'a' * 256):
+            for option in ('-S', '--source'):
+                with self.subTest(option=option, source=source[:40]):
+                    p = run_ping([option, source, '-n1', '127.0.0.1'])
+                    self.assertEqual(p.returncode, 2, p.stdout)
+                    self.assertNotIn('Reply from ', p.stdout)
+        for option in ('-S', '--source'):
+            p = run_ping([option])
+            self.assertEqual(p.returncode, 2, p.stdout)
+        for target in ('::1%', '::1%4294967296', '::1%1%2', '127.0.0.1%1'):
+            with self.subTest(target=target):
+                p = run_ping(['-n1', target])
+                self.assertEqual(p.returncode, 2, p.stdout)
+                self.assertNotIn('Reply from ', p.stdout)
+
+    def test_ipv6_tables_source_and_missing_returned_ttl(self):
+        for size in (0, 65500):
+            p = run_ping(['-6', '-S::1', '-n1', '-l', str(size), '::1'], pretty='1')
+            self.assertEqual(p.returncode, 0, p.stdout)
+            self.assert_table(p.stdout)
+            self.assertIn('Source', p.stdout)
+            self.assertIn('::1', p.stdout)
+            self.assertRegex(ANSI.sub('', p.stdout), r'\u2502\s*1\s*\u2502[^\n]+\u2502\s*-\s*\u2502')
+
+    def test_ipv6_flood_interval_quiet_and_timestamps(self):
+        p = run_ping(['-6', '-S::1', '--flood', '--interval', '600000',
+                      '--timestamp', '-n3', '::1'], pretty='1')
+        self.assertEqual(p.returncode, 0, p.stdout)
+        records = TIMESTAMP.findall(p.stdout)
+        self.assertEqual(len(records), 3, p.stdout)
+        self.assertTrue(all(result.startswith('Reply from ::1:') for _, result in records))
+        self.assertIn('Sent = 3, Received = 3, Lost = 0 (0% loss)', p.stdout)
+        self.assertNotIn('TTL=', p.stdout)
+        start = time.monotonic()
+        p = run_ping(['--quiet', '--interval', '100', '-6', '-n3', '::1'])
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertGreaterEqual(time.monotonic() - start, 0.18)
+        self.assertIn('Sent = 3, Received = 3, Lost = 0 (0% loss)', p.stdout)
+        self.assertNotIn('Reply from ', p.stdout)
+
+    def test_source_api_arguments_and_ipv6_fixture_replies(self):
+        for target in ('127.0.0.1', '::1'):
+            for pretty in (None, '1'):
+                with self.subTest(target=target, pretty=pretty):
+                    p = run_ping(['-S', target, '-n1', '-w17', target],
+                                 exe=self.mock, mode=26, pretty=pretty)
+                    self.assertEqual(p.returncode, 0, p.stdout)
+                    self.assertIn('23ms', p.stdout)
+                    if pretty:
+                        self.assert_table(p.stdout)
+                    else:
+                        self.assertIn('Sent = 1, Received = 1', p.stdout)
+
+    def test_ipv6_network_errors_and_setup_failure(self):
+        for mode, expected in ((2, 'Request timed out.'), (3, 'General failure.'),
+                               (4, 'Transmit failed, error 54321'),
+                               (22, 'Reply from 2001:db8::1: Hop limit expired in transit.'),
+                               (23, 'Destination unreachable.'),
+                               (24, 'Packet too big.'), (25, 'IPv6 scope mismatch.')):
+            for pretty in (None, '1'):
+                with self.subTest(mode=mode, pretty=pretty):
+                    p = run_ping(['-6', '--flood', '-n2', '::1'],
+                                 exe=self.mock, mode=mode, pretty=pretty)
+                    self.assertEqual(p.returncode, 1, p.stdout)
+                    self.assertIn(expected.lower(), p.stdout.lower())
+                    if pretty:
+                        self.assert_table(p.stdout)
+                    else:
+                        self.assertIn('Sent = 2, Received = 0, Lost = 2 (100% loss)', p.stdout)
+                    self.assertNotIn('Average =', p.stdout)
+        p = run_ping(['-6', '-n1', '::1'], exe=self.mock, mode=19)
+        self.assertEqual(p.returncode, 2, p.stdout)
+        self.assertIn('error: could not create ICMP handle', p.stdout)
+
+    def test_ipv6_worker_creation_failure(self):
+        p = run_ping(['-6', '-n1', '::1'], exe=self.mock, mode=28)
+        self.assertEqual(p.returncode, 2, p.stdout)
+        self.assertIn('error:', p.stdout)
+        self.assertNotIn('Reply from ', p.stdout)
+
+    def test_scoped_ipv6_reply_formatting_and_reverse_name_match(self):
+        p = run_ping(['-6', '-a', '-Sfe80::1%12', '-n1', 'fe80::1%12'],
+                     exe=self.mock, mode=29)
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn('Source address: fe80::1%12', p.stdout)
+        self.assertIn('Reply from scoped-test [fe80::1%12]: bytes=32 time=23ms', p.stdout)
+        self.assertNotIn('TTL=', p.stdout)
+
     def test_failures_have_failure_exit_code(self):
         p = run_ping(['-n1', '-w1', '0.0.0.0'])
         self.assertEqual(p.returncode, 1, p.stdout)
@@ -143,7 +312,7 @@ class PingTests(unittest.TestCase):
 
     def test_exact_flags_and_unsupported_options(self):
         for flag in ('-fgarbage', '-t1', '-a1', '-41', '-hxxx', '/?x', '-', '-z',
-                     '-6', '-j', '-k', '-s', '-S', '-R'):
+                     '-61', '-j', '-k', '-s', '-R'):
             with self.subTest(flag=flag):
                 p = run_ping([flag, '127.0.0.1'])
                 self.assertEqual(p.returncode, 2)
@@ -261,7 +430,7 @@ class PingTests(unittest.TestCase):
         self.assertIn('invalid or missing option value', p.stdout)
 
     def test_new_long_options_are_exact_and_case_sensitive(self):
-        for option in ('interval', 'quiet', 'timestamp'):
+        for option in ('interval', 'quiet', 'timestamp', 'source'):
             for flag in (f'--{option}1', f'--{option}=1', f'--{option}ing',
                          '--' + option[:-1], '--' + option.title(),
                          '--' + option.upper(), '-' + option,
@@ -349,7 +518,7 @@ class PingTests(unittest.TestCase):
                 self.assertIn('invalid or missing option value', p.stdout)
                 p = run_ping([*flags, '-n1', '127.0.0.1'], exe=self.mock, mode=19)
                 self.assertEqual(p.returncode, 2, p.stdout)
-                self.assertIn('error: IcmpCreateFile failed', p.stdout)
+                self.assertIn('error: could not create ICMP handle', p.stdout)
                 self.assertEqual(TIMESTAMP.findall(p.stdout), [])
 
     def test_timestamp_is_current_utc_and_forces_plain_output(self):
@@ -446,7 +615,7 @@ class PingTests(unittest.TestCase):
 
     def test_large_statistics_and_unhandled_console_events(self):
         exe = self.work / 'statistics.exe'
-        source = (ROOT / 'ping_win64.asm').read_text() + '''
+        source = application_source() + '''
 section .data
 test_stats_name db 'large-counter-test', 0
 section .text
@@ -489,14 +658,25 @@ test_stats_main:
         self.assertIn('Average = 23ms', p.stdout)
 
     def test_long_resolver_names_are_bounded_and_sanitized(self):
-        for pretty in (None, '1'):
-            p = run_ping(['-n1', '-a', 'example.test'], exe=self.mock, mode=10, pretty=pretty)
-            self.assertEqual(p.returncode, 0, p.stdout)
-            self.assertIn('y' + 'x' * 19 + '?', p.stdout)
-            self.assertNotIn('x' * 256, p.stdout)
-            if pretty:
-                self.assert_table(p.stdout)
-                self.assertIn('...', p.stdout)
+        for family in ('-4', '-6'):
+            for pretty in (None, '1'):
+                with self.subTest(family=family, pretty=pretty):
+                    p = run_ping([family, '-n1', '-a', 'example.test'],
+                                 exe=self.mock, mode=10, pretty=pretty)
+                    self.assertEqual(p.returncode, 0, p.stdout)
+                    self.assertIn('y' + 'x' * 19 + '?', p.stdout)
+                    self.assertNotIn('x' * 256, p.stdout)
+                    if pretty:
+                        self.assert_table(p.stdout)
+                        self.assertIn('...', p.stdout)
+
+    def test_reverse_lookup_failure_keeps_numeric_target(self):
+        for target in ('127.0.0.1', '::1'):
+            with self.subTest(target=target):
+                p = run_ping(['-n1', '-a', target], exe=self.mock, mode=27)
+                self.assertEqual(p.returncode, 0, p.stdout)
+                self.assertIn(target, p.stdout)
+                self.assertIn('Sent = 1, Received = 1', p.stdout)
 
     def test_interruption_before_first_send(self):
         for pretty in (None, '1'):
@@ -532,7 +712,8 @@ test_stats_main:
         self.assert_table(p.stdout)
 
     def test_ctrl_break_during_sleep_and_pending_reply(self):
-        cases = [(EXE, '0', 0, '127.0.0.1'), (self.mock, '12', 1, '127.0.0.1')]
+        cases = [(EXE, '0', 0, '127.0.0.1'), (self.mock, '12', 1, '127.0.0.1'),
+                 (EXE, '0', 0, '::1'), (self.mock, '12', 1, '::1')]
         if os.environ.get('PING_TEST_TIMEOUT_TARGET'):
             # Optional live pending-I/O regression; choose an address that drops ICMP.
             cases.append((EXE, '0', 1, os.environ['PING_TEST_TIMEOUT_TARGET']))

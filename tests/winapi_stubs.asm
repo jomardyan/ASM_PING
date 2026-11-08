@@ -2,14 +2,22 @@
 ; Production binaries never link these routines.
 section .data
 test_env db 'PING_TEST_MODE', 0
+test_scoped_name db 'scoped-test', 0
 test_long_name times 300 db 'x'
     db 0
-test_host dq test_long_name, 0
-    dw AF_INET, 4
+align 8
+test_ai4 dd 2, 2, 0, 0
+    dq 16, test_long_name, test_sock4, 0
+test_ai6 dd 2, 23, 0, 0
+    dq 28, test_long_name, test_sock6, 0
+test_sock4 dw 2, 0
+    db 127, 0, 0, 1
+    dq 0
+test_sock6 dw 23, 0
     dd 0
-    dq test_addrs
-test_addrs dq test_addr, 0
-test_addr db 127, 0, 0, 1
+    times 15 db 0
+    db 1
+    dd 0
 section .bss
 test_mode resd 1
 test_envbuf resb 16
@@ -103,15 +111,87 @@ test_IcmpCreateFile:
     mov rax, -1
     ret
 
-test_gethostbyname:
-    lea rax, [rel test_host]
+test_Icmp6CreateFile:
+    cmp dword [rel test_mode], 19
+    je test_IcmpCreateFile.fail
+    jmp Icmp6CreateFile
+
+test_getaddrinfo:
+    cmp dword [rel test_mode], 10
+    jne .normal
+    test dword [r8], 4           ; numeric parsing must still fail for a hostname
+    jnz .normal
+    lea rax, [rel test_ai4]
+    cmp dword [r8+4], 23
+    jne .resolved
+    lea rax, [rel test_ai6]
+.resolved:
+    mov [r9], rax
+    xor eax, eax
     ret
-test_gethostbyaddr:
-    ; Deliberately reuses hostent storage and changes it for reverse lookups.
-    mov byte [rel test_long_name], 'y'
-    mov byte [rel test_long_name+20], 27
-    lea rax, [rel test_host]
+.normal:
+    jmp getaddrinfo
+
+test_freeaddrinfo:
+    lea rax, [rel test_ai4]
+    cmp rcx, rax
+    je .done
+    lea rax, [rel test_ai6]
+    cmp rcx, rax
+    je .done
+    jmp freeaddrinfo
+.done:
     ret
+
+test_getnameinfo:
+    test dword [rsp+38h], 2      ; numeric formatting uses the real Winsock API
+    jnz .normal
+    cmp dword [rel test_mode], 27
+    je .missing
+    cmp dword [rel test_mode], 29
+    je .scoped
+    cmp dword [rel test_mode], 10
+    jne .normal
+    ; Return a full-sized reverse name including a control character. The
+    ; resolver must sanitize it and preserve its own bounded copy.
+    xor eax, eax
+    dec r9d
+.copy:
+    cmp eax, r9d
+    jae .terminate
+    mov byte [r8+rax], 'x'
+    inc eax
+    jmp .copy
+.terminate:
+    mov byte [r8+rax], 0
+    mov byte [r8], 'y'
+    mov byte [r8+20], 27
+    xor eax, eax
+    ret
+.missing:
+    mov eax, 11001
+    ret
+.scoped:
+    xor eax, eax
+    lea r10, [rel test_scoped_name]
+.copy_scoped:
+    mov dl, [r10+rax]
+    mov [r8+rax], dl
+    inc eax
+    test dl, dl
+    jnz .copy_scoped
+    xor eax, eax
+    ret
+.normal:
+    jmp getnameinfo
+
+test_CreateThread:
+    cmp dword [rel test_mode], 28
+    jne .normal
+    xor eax, eax
+    ret
+.normal:
+    jmp CreateThread
 
 test_SetConsoleCtrlHandler:
     cmp dword [rel test_mode], 11
@@ -240,6 +320,122 @@ test_IcmpSendEcho2:
     mov byte [rel g_output_error], 1
     mov byte [rel g_stop], 1
     jmp .fail
+
+test_IcmpSendEcho2Ex:
+    ; An explicit IPv4 source must reach the source-address API argument.
+    mov eax, [rel source_addr+4]
+    cmp [rsp+28h], eax
+    jne test_IcmpSendEcho2.abi_fail
+    ; Reuse the IPv4 reply fixture after adapting the extra source argument.
+    mov rax, [rsp+30h]
+    mov [rsp+28h], rax
+    mov rax, [rsp+38h]
+    mov [rsp+30h], rax
+    mov rax, [rsp+40h]
+    mov [rsp+38h], rax
+    mov rax, [rsp+48h]
+    mov [rsp+40h], rax
+    mov rax, [rsp+50h]
+    mov [rsp+48h], rax
+    mov rax, [rsp+58h]
+    mov [rsp+50h], rax
+    mov rax, [rsp+60h]
+    mov [rsp+58h], rax
+    jmp test_IcmpSendEcho2
+
+test_Icmp6SendEcho2:
+    ; The IPv6 worker makes a synchronous call so -w remains effective.
+    mov rax, rsp
+    and eax, 15
+    cmp eax, 8
+    jne test_IcmpSendEcho2.abi_fail
+    test rdx, rdx
+    jnz test_IcmpSendEcho2.abi_fail
+    test r8, r8
+    jnz test_IcmpSendEcho2.abi_fail
+    test r9, r9
+    jnz test_IcmpSendEcho2.abi_fail
+    cmp qword [rsp+58h], REPLY_CAP
+    jne test_IcmpSendEcho2.abi_fail
+    mov r10, [rsp+28h]
+    lea rax, [rel source_addr]
+    cmp r10, rax
+    jne test_IcmpSendEcho2.abi_fail
+    cmp word [r10], 23
+    jne test_IcmpSendEcho2.abi_fail
+    mov r11, [rsp+30h]
+    lea rax, [rel dest_addr]
+    cmp r11, rax
+    jne test_IcmpSendEcho2.abi_fail
+    cmp word [r11], 23
+    jne test_IcmpSendEcho2.abi_fail
+    mov eax, [rsp+60h]
+    cmp eax, [rel g_timeout]
+    jne test_IcmpSendEcho2.abi_fail
+    mov eax, [rel test_mode]
+    cmp eax, 12
+    je .pending
+    cmp eax, 2
+    je .fail
+    cmp eax, 3
+    je .fail
+    cmp eax, 4
+    je .fail
+    mov r10, [rsp+50h]
+    mov rax, [r11+8]
+    mov [r10+6], rax
+    mov rax, [r11+16]
+    mov [r10+14], rax
+    mov eax, [r11+24]
+    bswap eax
+    mov [r10+22], eax
+    mov dword [r10+28], 0
+    mov dword [r10+32], 23
+    mov eax, [rel test_mode]
+    cmp eax, 22
+    je .ttl
+    cmp eax, 23
+    je .unreachable
+    cmp eax, 24
+    je .too_big
+    cmp eax, 25
+    je .scope
+.success:
+    mov eax, 1
+    ret
+.ttl:
+    ; 2001:db8::1 in the returned IPV6_ADDRESS_EX.
+    mov dword [r10+6], 0B80D0120h
+    mov dword [r10+10], 0
+    mov rax, 0100000000000000h
+    mov [r10+14], rax
+    mov dword [r10+28], 11041
+    jmp .success
+.unreachable:
+    mov dword [r10+28], 11040
+    jmp .success
+.too_big:
+    mov dword [r10+28], 11009
+    jmp .success
+.scope:
+    mov dword [r10+28], 11045
+    jmp .success
+.fail:
+    xor eax, eax
+    ret
+.pending:
+    sub rsp, 28h
+    xor ecx, ecx
+    mov edx, 1
+    xor r8d, r8d
+    xor r9d, r9d
+    call CreateEventW
+    mov rcx, rax
+    mov edx, -1
+    call WaitForSingleObject
+    add rsp, 28h
+    xor eax, eax
+    ret
 
 test_WriteFile:
     cmp dword [rel test_mode], 13

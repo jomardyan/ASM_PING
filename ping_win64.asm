@@ -1,13 +1,13 @@
-; ping_win64.asm - IPv4 ICMP ping for Windows x64 (no CRT)
+; ping_win64.asm - IPv4/IPv6 ICMP ping for Windows x64 (no CRT)
 ; Modern table UI on real consoles (VT colors + box drawing, CP437 or UTF-8);
 ; classic plain-text output when stdout is redirected. Force pretty with env
 ; PING_PRETTY=1.
 ; Build: powershell -File build.ps1
 ; Run:
 ;   ping.exe [-t] [-a] [-n count] [-l size] [-f] [-i ttl] [-v tos]
-;            [-r count] [-w timeout] [-4] [--flood] target
+;            [-r count] [-w timeout] [-4|-6] [-S source] [--flood] target
 ;            [--interval ms] [--quiet] [--timestamp]
-;     -j/-k/-s/-S/-R/-6 are not implemented and are rejected.
+;     -j/-k/-s/-R are not implemented and are rejected.
 
 default rel
 
@@ -22,6 +22,7 @@ extern WideCharToMultiByte
 extern LocalFree
 extern GetLastError
 extern CreateEventW
+extern CreateThread
 extern SetEvent
 extern ResetEvent
 extern WaitForSingleObject
@@ -36,18 +37,20 @@ extern GetConsoleOutputCP
 extern GetEnvironmentVariableA
 extern IcmpCreateFile           ; iphlpapi
 extern IcmpSendEcho2
+extern IcmpSendEcho2Ex
+extern Icmp6CreateFile
+extern Icmp6SendEcho2
 extern IcmpParseReplies
 extern IcmpCloseHandle
 extern WSAStartup               ; ws2_32
 extern WSACleanup
-extern gethostbyname
-extern gethostbyaddr
 
 MAX_PAYLOAD  equ 65500
 REPLY_CAP    equ 65624          ; native x64 reply (40) + payload + 40 IP options + 8 error bytes
 TOKEN_CAP    equ 32768
 IP_FLAG_DF   equ 2
 AF_INET      equ 2
+AF_INET6     equ 23
 VT_ENABLE    equ 4              ; ENABLE_VIRTUAL_TERMINAL_PROCESSING
 CP_UTF8      equ 65001
 TBL_W        equ 80             ; sum(colw_main) + 6 borders
@@ -104,29 +107,36 @@ section .data
     s_ms_nl    db "ms", 13, 10, 0
     s_badhost1 db "Ping request could not find host ", 0
     s_badhost2 db ". Please check the name and try again.", 13, 10, 0
-    s_noicmp   db "error: IcmpCreateFile failed", 13, 10, 0
+    s_noicmp   db "error: could not create ICMP handle", 13, 10, 0
     s_wsa      db "error: WSAStartup failed", 13, 10, 0
-    s_unsup    db "error: option not supported by this IPv4 build", 13, 10, 0
-    s_badtgt   db "error: target must be an ASCII hostname or IPv4 address (max 255 bytes)", 13, 10, 0
+    s_unsup    db "error: option not supported", 13, 10, 0
+    s_badtgt   db "error: target must be an ASCII hostname or IP address (max 255 bytes)", 13, 10, 0
+    s_badsource db "error: source must be a numeric IPv4 or IPv6 address", 13, 10, 0
+    s_familyerr db "error: conflicting IPv4/IPv6 address families or options", 13, 10, 0
+    s_ipv4only db "error: -f, -r and -v require IPv4", 13, 10, 0
+    s_source   db "Source address: ", 0
     s_argerr   db "error: could not read command-line arguments", 13, 10, 0
     s_eventerr db "error: could not initialize interrupt handling", 13, 10, 0
+    s_threaderr db "error: could not start IPv6 request", 13, 10, 0
     s_badopt   db "error: unknown option ", 0
     s_badval   db "error: invalid or missing option value", 13, 10, 0
     s_duptgt   db "error: only one target allowed", 13, 10, 0
     s_dot      db ".", 0
     s_usage    db "usage: ping [-t] [-a] [-n count] [-l size] [-f] [-i ttl] [-v tos]", 13, 10
-               db "            [-r count] [-w timeout] [-4] [--flood]", 13, 10
+               db "            [-r count] [-w timeout] [-4|-6] [-S source] [--flood]", 13, 10
                db "            [--interval ms] [--quiet] [--timestamp] target", 13, 10, 13, 10
                db "  -t      ping the specified host until stopped (Ctrl+C)", 13, 10
                db "  -a      resolve addresses to hostnames", 13, 10
                db "  -n      number of echo requests (1-100000, default 4)", 13, 10
                db "  -l      send buffer size in bytes (default 32, max 65500)", 13, 10
-               db "  -f      set Don't Fragment flag on packets", 13, 10
-               db "  -i      Time To Live (1-255)", 13, 10
-               db "  -v      Type Of Service (0-255; may be ignored by Windows)", 13, 10
-               db "  -r      record route for <count> hops (1-9)", 13, 10
+               db "  -f      set Don't Fragment flag (IPv4 only)", 13, 10
+               db "  -i      Time To Live / IPv6 hop limit (1-255)", 13, 10
+               db "  -v      Type Of Service (IPv4 only; may be ignored by Windows)", 13, 10
+               db "  -r      record route for <count> hops (1-9, IPv4 only)", 13, 10
                db "  -w      reply timeout in milliseconds (1-600000, default 4000)", 13, 10
-               db "  -4      force IPv4 (the only mode in this build)", 13, 10
+               db "  -4, -6  force IPv4 or IPv6 (hostnames default to IPv4)", 13, 10
+               db "  -S, --source address  select a local numeric source address", 13, 10
+               db "          IPv6 literals select IPv6; use %index for a numeric scope ID", 13, 10
                db "  --flood send the next request immediately after each reply or timeout", 13, 10
                db "  --interval ms  request interval (1-600000 ms, default 1000; flood overrides)", 13, 10
                db "  --quiet        show the header and final statistics only", 13, 10
@@ -143,6 +153,7 @@ section .data
     s_intervalopt db "--interval", 0
     s_quietopt db "--quiet", 0
     s_timestampopt db "--timestamp", 0
+    s_sourceopt db "--source", 0
     s_floodtag db " | flood", 0
     s_floodmsg db "Flood mode: no interval between requests.", 13, 10, 13, 10, 0
     s_intervaltag db " | interval ", 0
@@ -170,6 +181,9 @@ section .data
     m_ttlexp   db "TTL expired in transit.", 0
     m_genfail  db "General failure.", 0
     m_frag     db "Packet needs fragmentation but DF is set.", 0
+    m_toobig   db "Packet too big.", 0
+    m_hoplimit db "Hop limit expired in transit.", 0
+    m_scope    db "IPv6 scope mismatch.", 0
     m_fail     db "Transmit failed, error ", 0
     s_ellipsis db "...", 0
     s_spaces   times TBL_W db ' '
@@ -223,6 +237,12 @@ section .bss
     written    resq 1
     sendbuf    resb 65536
     replybuf   resb REPLY_CAP
+    reply6buf  resb REPLY_CAP
+    reply_addr resb 28
+    reply_ipstr resb 64
+    g_reply_is_target resb 1
+    g_worker_result resd 1
+    g_worker_error resd 1
     wsadata    resb 408
     optinfo    resb 16
     routedata  resb 44
@@ -256,6 +276,7 @@ section .bss
     g_interval resq 1
     g_ttl      resb 1
     g_tos      resb 1
+    g_tos_set  resb 1
     g_df       resb 1
     g_resolve  resb 1
     g_infinite resb 1
@@ -276,9 +297,9 @@ section .bss
     g_colw     resq 1
     g_ncols    resq 1
     row_cells  resq 5
-    hdr1       resb 320             ; bounded name + label + IPv4 address
+    hdr1       resb 384             ; bounded name + label + scoped IPv6 address
     hdr2       resb 128
-    ipstr      resb 16
+    ipstr      resb 64
     seqbuf     resb 32
     frombuf    resb 256
     bytesbuf   resb 8
@@ -289,7 +310,7 @@ section .bss
 
 section .text
 main:
-    sub     rsp, 78h              ; shadow space, eleven API arguments, locals
+    sub     rsp, 78h              ; shadow space, twelve API arguments, locals
 
     ; defaults
     mov     qword [rel g_count], 4
@@ -394,6 +415,10 @@ main:
     je      .target_char
     cmp     al, '_'
     je      .target_char
+    cmp     al, ':'
+    je      .target_char
+    cmp     al, '%'
+    je      .target_char
     cmp     al, '0'
     jb      .badtgt
     cmp     al, '9'
@@ -424,6 +449,8 @@ main:
     jz      .badopt
     cmp     r9b, 'R'
     je      .unsup
+    cmp     r9b, 'S'
+    je      .opt_source
     cmp     al, 'A'
     jb      .lc_done
     cmp     al, 'Z'
@@ -452,20 +479,18 @@ main:
     cmp     al, 't'
     je      .opt_t
     cmp     al, '4'
-    je      .argloop
+    je      .opt_ipv4
     cmp     al, '?'
     je      .help
     cmp     al, 'h'
     je      .help
     cmp     al, '6'
-    je      .unsup
+    je      .opt_ipv6
     cmp     al, 'j'
     je      .unsup
     cmp     al, 'k'
     je      .unsup
     cmp     al, 's'
-    je      .unsup
-    cmp     r9b, 'S'
     je      .unsup
     jmp     .badopt
 
@@ -486,7 +511,52 @@ main:
     call    option_equal
     test    eax, eax
     jnz     .opt_timestamp
+    lea     rdx, [rel s_sourceopt]
+    call    option_equal
+    test    eax, eax
+    jnz     .opt_source_long
     jmp     .badopt
+.opt_ipv4:
+    cmp     dword [rel g_family_force], AF_INET6
+    je      .familyerr
+    mov     dword [rel g_family_force], AF_INET
+    jmp     .argloop
+.opt_ipv6:
+    cmp     dword [rel g_family_force], AF_INET
+    je      .familyerr
+    mov     dword [rel g_family_force], AF_INET6
+    jmp     .argloop
+.opt_source:
+    call    get_val
+    jmp     .source_value
+.opt_source_long:
+    call    next_token
+.source_value:
+    test    rax, rax
+    jz      .badsource
+    mov     rcx, rax
+    lea     rdi, [rel source_text]
+    xor     edx, edx
+.copy_source:
+    movzx   eax, byte [rcx+rdx]
+    test    al, al
+    jz      .source_end
+    cmp     edx, 255
+    jae     .badsource
+    ; Numeric-only resolution performs full validation, including scope IDs.
+    cmp     al, 33
+    jb      .badsource
+    cmp     al, 126
+    ja      .badsource
+    mov     [rdi+rdx], al
+    inc     edx
+    jmp     .copy_source
+.source_end:
+    test    edx, edx
+    jz      .badsource
+    mov     byte [rdi+rdx], 0
+    mov     byte [rel g_has_source], 1
+    jmp     .argloop
 .opt_flood:
     mov     byte [rel g_flood], 1
     jmp     .argloop
@@ -578,6 +648,7 @@ main:
     cmp     eax, 255
     ja      .badval
     mov     [rel g_tos], al
+    mov     byte [rel g_tos_set], 1
     jmp     .argloop
 .opt_rr:
     call    get_val
@@ -621,6 +692,14 @@ main:
     lea     rcx, [rel s_badval]
     call    print_sz
     jmp     .exit2
+.badsource:
+    lea     rcx, [rel s_badsource]
+    call    print_sz
+    jmp     .exit2
+.familyerr:
+    lea     rcx, [rel s_familyerr]
+    call    print_sz
+    jmp     .exit2
 .badtgt:
     lea     rcx, [rel s_badtgt]
     call    print_sz
@@ -651,40 +730,27 @@ main:
     jnz     .wsa_fail
     mov     byte [rel g_wsa], 1
 
-    ; ---- resolve target ----
-    lea     rsi, [rel tgtbuf]
-    call    parse_ip4
-    test    rax, rax
-    jz      .dns
-    mov     r12d, edx
-    lea     rsi, [rel tgtbuf]
-    lea     rdi, [rel namebuf]
-    call    append_name
-    jmp     .resolved
-.dns:
-    lea     rcx, [rel tgtbuf]
-    call    gethostbyname
-    test    rax, rax
-    jz      .nohost
-    cmp     word [rax+16], AF_INET
-    jne     .nohost
-    cmp     word [rax+18], 4
-    jne     .nohost
-    mov     rcx, [rax+24]
-    test    rcx, rcx
-    jz      .nohost
-    mov     rcx, [rcx]
-    test    rcx, rcx
-    jz      .nohost
-    mov     r12d, [rcx]
-    mov     rsi, [rax]
-    test    rsi, rsi
-    jnz     .copy_name
-    lea     rsi, [rel tgtbuf]
-.copy_name:
-    lea     rdi, [rel namebuf]
-    call    append_name
-    jmp     .resolved
+    ; Resolve both endpoints once, before creating an ICMP handle.
+    call    resolve_endpoints
+    cmp     eax, 2
+    je      .badsource
+    cmp     eax, 3
+    je      .familyerr
+    test    eax, eax
+    jnz     .nohost
+    mov     r12d, [rel dest_addr+4]
+    cmp     dword [rel g_family], AF_INET6
+    jne     .resolved
+    cmp     byte [rel g_df], 0
+    jne     .ipv4only
+    cmp     qword [rel g_rr], 0
+    jne     .ipv4only
+    cmp     byte [rel g_tos_set], 0
+    je      .resolved
+.ipv4only:
+    lea     rcx, [rel s_ipv4only]
+    call    print_sz
+    jmp     .exit2
 .nohost:
     lea     rcx, [rel s_badhost1]
     call    print_sz
@@ -698,24 +764,6 @@ main:
     call    print_sz
     jmp     .exit1
 .resolved:
-    ; Winsock's hostent storage is reused by later resolver calls.
-    lea     rax, [rel namebuf]
-    mov     [rel g_name], rax
-    cmp     byte [rel g_resolve], 0
-    je      .name_ready
-    mov     [rel ip_scr], r12d
-    lea     rcx, [rel ip_scr]
-    mov     edx, 4
-    mov     r8d, AF_INET
-    call    gethostbyaddr
-    test    rax, rax
-    jz      .name_ready
-    mov     rsi, [rax]
-    test    rsi, rsi
-    jz      .name_ready
-    lea     rdi, [rel namebuf]
-    call    append_name
-.name_ready:
 
     ; ---- header ----
     cmp     byte [rel g_pretty], 0
@@ -740,10 +788,6 @@ main:
     mov     rdi, r15
     call    append_str
     mov     r15, rax
-    mov     [rel ip_scr], r12d
-    lea     rsi, [rel ip_scr]
-    lea     rdi, [rel ipstr]
-    call    ip_str
     lea     rsi, [rel ipstr]
     mov     rdi, r15
     call    append_str
@@ -754,6 +798,17 @@ main:
     lea     rcx, [rel hdr1]
     mov     edx, TBL_W
     call    box_line
+    cmp     byte [rel g_has_source], 0
+    je      .hdr_source_done
+    lea     rdi, [rel hdr1]
+    lea     rsi, [rel s_source]
+    call    append_str
+    lea     rsi, [rel source_ipstr]
+    call    append_str
+    lea     rcx, [rel hdr1]
+    mov     edx, TBL_W
+    call    box_line
+.hdr_source_done:
     ; line 2: "payload N bytes | timeout N ms"
     lea     r15, [rel hdr2]
     lea     rsi, [rel s_payl]
@@ -807,15 +862,23 @@ main:
     call    print_sz
     lea     rcx, [rel s_lb]
     call    print_sz
-    mov     [rel ip_scr], r12d
-    lea     rcx, [rel ip_scr]
-    call    print_ip
+    lea     rcx, [rel ipstr]
+    call    print_sz
     lea     rcx, [rel s_rb_with]
     call    print_sz
     mov     eax, [rel g_size]
     call    print_dec
     lea     rcx, [rel s_bytesdat]
     call    print_sz
+    cmp     byte [rel g_has_source], 0
+    je      .hdr_plain_source_done
+    lea     rcx, [rel s_source]
+    call    print_sz
+    lea     rcx, [rel source_ipstr]
+    call    print_sz
+    lea     rcx, [rel s_nl]
+    call    print_sz
+.hdr_plain_source_done:
     cmp     byte [rel g_flood], 0
     je      .hdr_plain_interval
     lea     rcx, [rel s_floodmsg]
@@ -835,7 +898,13 @@ main:
 .hdr_done:
 
     ; ---- ICMP handle + Ctrl+C handler ----
+    cmp     dword [rel g_family], AF_INET6
+    je      .create_ipv6
     call    IcmpCreateFile
+    jmp     .created_icmp
+.create_ipv6:
+    call    Icmp6CreateFile
+.created_icmp:
     cmp     rax, -1
     je      .icmperr
     mov     rbx, rax
@@ -973,6 +1042,11 @@ main:
     xor     eax, eax
     mov     ecx, 5
     rep stosq
+    inc     r14
+    cmp     dword [rel g_family], AF_INET6
+    je      .send_ipv6
+    cmp     byte [rel g_has_source], 0
+    jne     .send_ipv4_source
     mov     rcx, rbx
     mov     rdx, [rel g_reply_event]
     xor     r8d, r8d
@@ -989,14 +1063,58 @@ main:
     mov     qword [rsp+48h], REPLY_CAP
     mov     eax, [rel g_timeout]
     mov     [rsp+50h], rax
-    inc     r14
     call    IcmpSendEcho2
+    jmp     .send_result
+.send_ipv4_source:
+    mov     rcx, rbx
+    mov     rdx, [rel g_reply_event]
+    xor     r8d, r8d
+    xor     r9d, r9d
+    mov     eax, [rel source_addr+4]
+    mov     [rsp+20h], rax
+    mov     [rsp+28h], r12
+    lea     rax, [rel sendbuf]
+    mov     [rsp+30h], rax
+    mov     rax, [rel g_size]
+    mov     [rsp+38h], rax
+    mov     rax, [rel g_optptr]
+    mov     [rsp+40h], rax
+    lea     rax, [rel replybuf]
+    mov     [rsp+48h], rax
+    mov     qword [rsp+50h], REPLY_CAP
+    mov     eax, [rel g_timeout]
+    mov     [rsp+58h], rax
+    call    IcmpSendEcho2Ex
+.send_result:
     test    eax, eax
     jnz     .got_reply
     call    GetLastError
     cmp     eax, 997               ; ERROR_IO_PENDING
     jne     .fail_code
     mov     byte [rel g_pending], 1
+    jmp     .wait_reply
+.send_ipv6:
+    ; IPv6 asynchronous ICMP ignores Timeout according to its API contract.
+    ; A synchronous worker honors it while the main thread can wait for Ctrl+C.
+    lea     rdi, [rel reply6buf]
+    xor     eax, eax
+    mov     ecx, 5
+    rep stosq
+    mov     dword [rel g_worker_result], 0
+    mov     dword [rel g_worker_error], 0
+    mov     byte [rel g_pending], 1
+    xor     ecx, ecx
+    xor     edx, edx
+    lea     r8, [rel ipv6_worker]
+    xor     r9d, r9d
+    mov     qword [rsp+20h], 0
+    mov     qword [rsp+28h], 0
+    call    CreateThread
+    test    rax, rax
+    jz      .worker_failed
+    mov     rcx, rax              ; closing this handle does not stop the worker
+    call    CloseHandle
+.wait_reply:
     mov     ecx, 2
     lea     rdx, [rel g_stop_event]
     xor     r8d, r8d
@@ -1007,12 +1125,26 @@ main:
     cmp     eax, 1                 ; reply event
     jne     .eventerr
     mov     byte [rel g_pending], 0
+    cmp     dword [rel g_family], AF_INET6
+    je      .ipv6_completed
     lea     rcx, [rel replybuf]
     mov     edx, REPLY_CAP
     call    IcmpParseReplies
     test    eax, eax
     jz      .fail
+    jmp     .got_reply
+.worker_failed:
+    mov     byte [rel g_pending], 0
+    lea     rcx, [rel s_threaderr]
+    call    print_sz
+    jmp     .exit2
+.ipv6_completed:
+    cmp     dword [rel g_worker_result], 0
+    jne     .got_reply
+    mov     eax, [rel g_worker_error]
+    jmp     .fail_code
 .got_reply:
+    call    normalize_reply
     cmp     dword [rel replybuf+4], 0
     jne     .reply_err
 
@@ -1045,14 +1177,14 @@ main:
     lea     rdi, [rel frombuf]
     cmp     byte [rel g_resolve], 0
     je      .fr_ip
-    cmp     [rel replybuf], r12d
-    jne     .fr_ip
+    cmp     byte [rel g_reply_is_target], 0
+    je      .fr_ip
     mov     rsi, [rel g_name]
     call    append_str
     jmp     .fr_done
 .fr_ip:
-    lea     rsi, [rel replybuf]
-    call    ip_str
+    lea     rsi, [rel reply_ipstr]
+    call    append_str
 .fr_done:
     ; bytes
     lea     rdi, [rel bytesbuf]
@@ -1073,8 +1205,15 @@ main:
 .t_done:
     ; ttl
     lea     rdi, [rel ttlbuf]
+    cmp     dword [rel g_family], AF_INET6
+    je      .ttl_unavailable
     movzx   eax, byte [rel replybuf+24]
     call    append_dec
+    jmp     .ttl_done
+.ttl_unavailable:
+    lea     rsi, [rel s_dash]
+    call    append_str
+.ttl_done:
     ; row cells
     lea     rax, [rel seqbuf]
     mov     [rel row_cells+0], rax
@@ -1098,20 +1237,20 @@ main:
     call    print_sz
     cmp     byte [rel g_resolve], 0
     je      .norev
-    cmp     [rel replybuf], r12d
-    jne     .norev
+    cmp     byte [rel g_reply_is_target], 0
+    je      .norev
     mov     rcx, [rel g_name]
     call    print_sz
     lea     rcx, [rel s_lb]
     call    print_sz
-    lea     rcx, [rel replybuf]
-    call    print_ip
+    lea     rcx, [rel reply_ipstr]
+    call    print_sz
     lea     rcx, [rel s_rb_col]
     call    print_sz
     jmp     .bytes
 .norev:
-    lea     rcx, [rel replybuf]
-    call    print_ip
+    lea     rcx, [rel reply_ipstr]
+    call    print_sz
     lea     rcx, [rel s_colon_b]
     call    print_sz
 .bytes:
@@ -1133,10 +1272,13 @@ main:
     lea     rcx, [rel s_ms]
     call    print_sz
 .ttl:
+    cmp     dword [rel g_family], AF_INET6
+    je      .reply_newline
     lea     rcx, [rel s_ttl]
     call    print_sz
     movzx   eax, byte [rel replybuf+24]
     call    print_dec
+.reply_newline:
     lea     rcx, [rel s_nl]
     call    print_sz
     ; fall into route
@@ -1160,9 +1302,9 @@ main:
     lea     rsi, [rel s_reply]
     call    append_str
     mov     [rsp+40h], rax
-    lea     rsi, [rel replybuf]
+    lea     rsi, [rel reply_ipstr]
     mov     rdi, rax
-    call    ip_str
+    call    append_str
     mov     [rsp+40h], rax
     lea     rsi, [rel s_colon_sp]
     mov     rdi, rax
@@ -1182,10 +1324,16 @@ main:
     je      .m_unr
     cmp     eax, 11005
     je      .m_unr
+    cmp     eax, 11040
+    je      .m_unr
     cmp     eax, 11013
     je      .m_ttl
     cmp     eax, 11014
     je      .m_ttl
+    cmp     eax, 11041
+    je      .m_ttl
+    cmp     eax, 11045
+    je      .m_scope
     cmp     eax, 11050
     je      .m_gf
     cmp     eax, 11009
@@ -1199,12 +1347,21 @@ main:
     jmp     .app_msg
 .m_ttl:
     lea     r13, [rel m_ttlexp]
+    cmp     dword [rel g_family], AF_INET6
+    jne     .app_msg
+    lea     r13, [rel m_hoplimit]
     jmp     .app_msg
 .m_gf:
     lea     r13, [rel m_genfail]
     jmp     .app_msg
 .m_frag:
     lea     r13, [rel m_frag]
+    cmp     dword [rel g_family], AF_INET6
+    jne     .app_msg
+    lea     r13, [rel m_toobig]
+    jmp     .app_msg
+.m_scope:
+    lea     r13, [rel m_scope]
 .app_msg:
     mov     rsi, r13
     mov     rdi, [rsp+40h]
@@ -1529,6 +1686,96 @@ main:
     mov     ecx, 2
 .exit_ready:
     call    ExitProcess
+
+; ---------- IPv6 worker ----------
+; Thread entry uses only volatile registers. All request storage is static and
+; remains alive if the main thread exits during the blocking ICMP call.
+ipv6_worker:
+    sub     rsp, 68h
+    mov     rcx, [rel g_icmp]
+    xor     edx, edx              ; synchronous: Timeout is honored by Windows
+    xor     r8d, r8d
+    xor     r9d, r9d
+    lea     rax, [rel source_addr]
+    mov     [rsp+20h], rax
+    lea     rax, [rel dest_addr]
+    mov     [rsp+28h], rax
+    lea     rax, [rel sendbuf]
+    mov     [rsp+30h], rax
+    mov     rax, [rel g_size]
+    mov     [rsp+38h], rax
+    mov     rax, [rel g_optptr]
+    mov     [rsp+40h], rax
+    lea     rax, [rel reply6buf]
+    mov     [rsp+48h], rax
+    mov     qword [rsp+50h], REPLY_CAP
+    mov     eax, [rel g_timeout]
+    mov     [rsp+58h], rax
+    call    Icmp6SendEcho2
+    mov     [rel g_worker_result], eax
+    test    eax, eax
+    jnz     .done
+    call    GetLastError
+    mov     [rel g_worker_error], eax
+.done:
+    mov     rcx, [rel g_reply_event]
+    call    SetEvent
+    ; No shared-state or handle access after signaling completion.
+    xor     eax, eax
+    add     rsp, 68h
+    ret
+
+; Normalize the native IPv6 header into the common status/RTT/size fields.
+; IPv6 exposes neither reply size nor received hop limit; use request size and
+; omit TTL in the renderer. Keep the IPv4 options header intact for record route.
+normalize_reply:
+    sub     rsp, 28h
+    lea     rdi, [rel reply_addr]
+    xor     eax, eax
+    mov     ecx, 7
+    rep stosd
+    mov     byte [rel g_reply_is_target], 0
+    cmp     dword [rel g_family], AF_INET6
+    je      .ipv6
+    mov     word [rel reply_addr], AF_INET
+    mov     eax, [rel replybuf]
+    mov     [rel reply_addr+4], eax
+    cmp     eax, [rel dest_addr+4]
+    sete    byte [rel g_reply_is_target]
+    jmp     .format
+.ipv6:
+    mov     word [rel reply_addr], AF_INET6
+    mov     rax, [rel reply6buf+6]
+    mov     [rel reply_addr+8], rax
+    mov     rdx, [rel reply6buf+14]
+    mov     [rel reply_addr+16], rdx
+    mov     ecx, [rel reply6buf+22]
+    bswap   ecx                  ; IPV6_ADDRESS_EX scope uses network byte order
+    mov     [rel reply_addr+24], ecx
+    cmp     rax, [rel dest_addr+8]
+    jne     .ipv6_fields
+    cmp     rdx, [rel dest_addr+16]
+    jne     .ipv6_fields
+    cmp     ecx, [rel dest_addr+24]
+    sete    byte [rel g_reply_is_target]
+.ipv6_fields:
+    mov     eax, [rel reply6buf+28]
+    mov     [rel replybuf+4], eax
+    mov     eax, [rel reply6buf+32]
+    mov     [rel replybuf+8], eax
+    mov     eax, [rel g_size]
+    mov     [rel replybuf+12], ax
+.format:
+    lea     rcx, [rel reply_addr]
+    lea     rdx, [rel reply_ipstr]
+    mov     r8d, 64
+    call    format_address
+    test    eax, eax
+    jz      .done
+    mov     word [rel reply_ipstr], '-'
+.done:
+    add     rsp, 28h
+    ret
 
 ; ---------- Ctrl+C handler ----------
 ctrl_handler:
@@ -2198,3 +2445,5 @@ stat_row:
     call    print_row
     add     rsp, 28h
     ret
+
+%include "net_resolve.asm"

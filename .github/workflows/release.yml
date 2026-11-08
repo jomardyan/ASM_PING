@@ -1,0 +1,120 @@
+name: Draft release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-package:
+    name: Build, test, and package
+    runs-on: windows-2022
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate version tag
+        run: |
+          if ($env:RELEASE_TAG -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$') {
+            throw 'Expected a tag such as v1.0.0 or v1.0.0-rc.1.'
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Build
+        run: ./build.ps1
+
+      - name: Run regression tests
+        run: python tests/test_ping.py
+
+      - name: Package executable and checksums
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $PWD 'dist'
+          $null = New-Item -ItemType Directory -Path $output -Force
+          $archive = Join-Path $output "ping-$env:RELEASE_TAG-windows-x64.zip"
+          $files = @('ping.exe', 'README.md')
+          foreach ($optional in @('LICENSE', 'LICENSE.md', 'CHANGELOG.md')) {
+            if (Test-Path -LiteralPath $optional -PathType Leaf) {
+              $files += $optional
+            }
+          }
+          $metadata = Join-Path $output 'BUILDINFO.txt'
+          @("Version: $env:RELEASE_TAG", "Commit: $env:GITHUB_SHA", 'Platform: Windows x64') |
+            Set-Content -LiteralPath $metadata -Encoding utf8
+          $files += $metadata
+          Compress-Archive -LiteralPath $files -DestinationPath $archive -CompressionLevel Optimal
+          $digest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksum = "$digest  $([IO.Path]::GetFileName($archive))`n"
+          [IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS.txt'), $checksum, [Text.Encoding]::ASCII)
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  draft-release:
+    name: Create draft GitHub release
+    needs: build-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download tested release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create or refresh draft
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum --check SHA256SUMS.txt
+          archive="ping-${RELEASE_TAG}-windows-x64.zip"
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft'); then
+            if [[ "$draft" != true ]]; then
+              echo 'This release is already published; its assets will not be replaced.' >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" "$archive" SHA256SUMS.txt --clobber
+          else
+            flags=()
+            version="${RELEASE_TAG%%+*}"
+            if [[ "$version" == *-* ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "$archive" SHA256SUMS.txt \
+              --verify-tag --draft --generate-notes \
+              --title "Windows x64 assembly ping ${RELEASE_TAG}" "${flags[@]}"
+          fi

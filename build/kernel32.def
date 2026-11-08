@@ -1,5 +1,6 @@
 LIBRARY kernel32
 EXPORTS
+    CreateThread
     GetStdHandle
     WriteFile
     ExitProcess
