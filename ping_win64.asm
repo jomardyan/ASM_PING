@@ -1,4 +1,4 @@
-; ping_win64.asm - IPv4/IPv6 ICMP ping for Windows x64 (no CRT)
+; ASM PING - IPv4/IPv6 ICMP ping for Windows x64 (no CRT)
 ; Modern table UI on real consoles (VT colors + box drawing, CP437 or UTF-8);
 ; classic plain-text output when stdout is redirected. Force pretty with env
 ; PING_PRETTY=1.
@@ -144,7 +144,7 @@ section .data
                db "  -h, -?  show this help", 13, 10
                db "  Exit codes: 0 = success/help, 1 = no replies/target, 2 = usage/setup/output error.", 13, 10, 0
     ; ---- pretty UI strings ----
-    s_pingcaps db "PING ", 0
+    s_pingcaps db "ASM PING ", 0
     s_rb       db "]", 0
     s_payl     db "payload ", 0
     s_bytes2   db " bytes | timeout ", 0

@@ -10,8 +10,9 @@ Suggested metadata:
 
 | Field | Suggested value |
 | --- | --- |
-| Name | `ping-win64-asm` |
-| Description | Windows x64 ICMP ping client in NASM assembly, with IPv4/IPv6, source selection, timestamps, and console tables. |
+| Project name | ASM PING |
+| Repository name | `ASM-PING` |
+| Description | ASM PING: Windows x64 ICMP ping client in NASM assembly, with IPv4/IPv6, source selection, timestamps, and console tables. |
 | Topics | `windows`, `x64`, `assembly`, `nasm`, `icmp`, `ping`, `ipv4`, `ipv6`, `cli`, `network-diagnostics` |
 
 Before the first public push:
@@ -26,15 +27,15 @@ Before the first public push:
 4. Add that repository as the Git remote, review `git status`, commit the intended
    source changes, and push `main`.
 5. Fill in the About description and topics, enable Issues and Actions if needed,
-   and check the first **Windows CI** run.
+   and check the first **ASM PING CI** run.
 
 No owner, remote URL, maintainer email, or badge URL is assumed in these files.
 Add repository-specific links once the actual repository exists.
 
 ## Continuous integration
 
-The **Windows CI** workflow runs on branch pushes, pull requests, and manual
-dispatch. It builds and tests on Windows, then uploads a `ping-windows-x64`
+The **ASM PING CI** workflow runs on branch pushes, pull requests, and manual
+dispatch. It builds and tests on Windows, then uploads an `asm-ping-windows-x64`
 artifact. Contributors can use that artifact to inspect the executable built
 from a particular successful run.
 
@@ -50,7 +51,7 @@ needs; release creation uses a separate workflow.
    to that commit. Version tags use `vMAJOR.MINOR.PATCH`, with an optional prerelease
    or build suffix.
 3. The release workflow builds and tests the tagged source, then creates a
-   **draft** GitHub release. Its assets are `ping-<tag>-windows-x64.zip` and
+   **draft** GitHub release. Its assets are `asm-ping-<tag>-windows-x64.zip` and
    `SHA256SUMS.txt`. The archive contains the executable and project documentation,
    including `LICENSE` when present.
 4. Inspect the workflow result, download and try the archive, review the release
@@ -59,7 +60,7 @@ needs; release creation uses a separate workflow.
 To inspect a downloaded archive's checksum in PowerShell:
 
 ```powershell
-Get-FileHash .\ping-v1.0.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\asm-ping-v1.0.0-windows-x64.zip -Algorithm SHA256
 ```
 
 Compare the result with the matching entry in `SHA256SUMS.txt`.

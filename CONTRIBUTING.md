@@ -1,6 +1,6 @@
 # Contributing
 
-This is a Windows x64 command-line ICMP client written in NASM assembly. Keep
+ASM PING is a Windows x64 command-line ICMP client written in NASM assembly. Keep
 changes focused and include enough context for someone else to reproduce the
 behavior.
 

@@ -1,4 +1,4 @@
-name: Draft release
+name: ASM PING draft release
 
 on:
   push:
@@ -50,7 +50,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $output = Join-Path $PWD 'dist'
           $null = New-Item -ItemType Directory -Path $output -Force
-          $archive = Join-Path $output "ping-$env:RELEASE_TAG-windows-x64.zip"
+          $archive = Join-Path $output "asm-ping-$env:RELEASE_TAG-windows-x64.zip"
           $files = @('ping.exe', 'README.md')
           foreach ($optional in @('LICENSE', 'LICENSE.md', 'CHANGELOG.md')) {
             if (Test-Path -LiteralPath $optional -PathType Leaf) {
@@ -58,7 +58,7 @@ jobs:
             }
           }
           $metadata = Join-Path $output 'BUILDINFO.txt'
-          @("Version: $env:RELEASE_TAG", "Commit: $env:GITHUB_SHA", 'Platform: Windows x64') |
+          @('Project: ASM PING', "Version: $env:RELEASE_TAG", "Commit: $env:GITHUB_SHA", 'Platform: Windows x64') |
             Set-Content -LiteralPath $metadata -Encoding utf8
           $files += $metadata
           Compress-Archive -LiteralPath $files -DestinationPath $archive -CompressionLevel Optimal
@@ -101,7 +101,7 @@ jobs:
         run: |
           set -euo pipefail
           sha256sum --check SHA256SUMS.txt
-          archive="ping-${RELEASE_TAG}-windows-x64.zip"
+          archive="asm-ping-${RELEASE_TAG}-windows-x64.zip"
           if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft'); then
             if [[ "$draft" != true ]]; then
               echo 'This release is already published; its assets will not be replaced.' >&2
@@ -116,5 +116,5 @@ jobs:
             fi
             gh release create "$RELEASE_TAG" "$archive" SHA256SUMS.txt \
               --verify-tag --draft --generate-notes \
-              --title "Windows x64 assembly ping ${RELEASE_TAG}" "${flags[@]}"
+              --title "ASM PING ${RELEASE_TAG}" "${flags[@]}"
           fi

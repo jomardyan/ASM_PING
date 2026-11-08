@@ -1,6 +1,6 @@
-# Windows x64 assembly ping
+# ASM PING
 
-A NASM IPv4 and IPv6 ICMP ping client using Windows APIs, without a C runtime. It shows
+ASM PING is a NASM IPv4 and IPv6 ICMP ping client for Windows x64, without a C runtime. It shows
 tables in a console and plain text when redirected. Normal ICMP probes do not
 require an administrator prompt.
 

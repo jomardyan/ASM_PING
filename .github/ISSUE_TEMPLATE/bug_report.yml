@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem with the Windows ping client.
+description: Report a reproducible problem with ASM PING.
 title: "[Bug]: "
 body:
   - type: textarea
