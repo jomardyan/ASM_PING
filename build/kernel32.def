@@ -3,9 +3,18 @@ EXPORTS
     GetStdHandle
     WriteFile
     ExitProcess
-    GetCommandLineA
+    GetCommandLineW
+    WideCharToMultiByte
+    LocalFree
     GetLastError
-    Sleep
+    CreateEventW
+    SetEvent
+    ResetEvent
+    WaitForSingleObject
+    WaitForMultipleObjects
+    CloseHandle
+    GetTickCount64
+    GetSystemTime
     SetConsoleCtrlHandler
     GetConsoleMode
     SetConsoleMode

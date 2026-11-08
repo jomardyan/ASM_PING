@@ -1,5 +1,6 @@
 LIBRARY iphlpapi
 EXPORTS
     IcmpCreateFile
-    IcmpSendEcho
+    IcmpSendEcho2
+    IcmpParseReplies
     IcmpCloseHandle
