@@ -1,5 +1,23 @@
 ; Test-only Win32 boundary fixtures, appended to an instrumented source copy.
 ; Production binaries never link these routines.
+;
+; READING GUIDE
+; test_ping.py copies the application source, redirects selected CALL targets
+; to these test_* labels, and appends this file before assembling a test EXE.
+; PING_TEST_MODE selects a deterministic scenario; the Python tests define the
+; expected output/exit code. This makes timeout, malformed reply, partial output,
+; and setup-error paths testable without depending on an external network.
+;
+; Each fixture receives the same Win64 arguments as the API it replaces. A JMP
+; to the real API is a tail call: it reuses the original return address and stack
+; arguments. At function entry RSP is 8 mod 16, and stack argument 5 is at +28h,
+; because CALL pushed 8 bytes after the caller placed that argument at +20h.
+; Some fixtures inspect this layout to catch ABI mistakes independently of text
+; output. They set g_output_error/g_stop on failure so tests observe exit code 2.
+;
+; Most nonsimulated operations pass through to Windows. Resolver fixtures below
+; return static ADDRINFOA/sockaddr objects, so their matching free fixture must
+; recognize these addresses and avoid passing them to the real allocator.
 section .data
 test_env db 'PING_TEST_MODE', 0
 test_scoped_name db 'scoped-test', 0
@@ -23,6 +41,8 @@ test_mode resd 1
 test_envbuf resb 16
 section .text
 
+; This is an early call during application startup, so it also reads the scenario
+; once. Save the real API's arguments across environment lookup and parse_u32.
 test_GetConsoleMode:
     sub rsp, 38h
     mov [rsp+20h], rcx
@@ -47,6 +67,8 @@ test_GetConsoleMode:
     mov eax, 1
     ret
 
+; Modes 16/17 simulate a console without/with VT support. Other modes keep normal
+; Windows behavior; mode 17 also checks the enable/restore values we receive.
 test_SetConsoleMode:
     cmp dword [rel test_mode], 16
     je .no_vt
@@ -76,6 +98,8 @@ test_GetConsoleOutputCP:
     mov eax, CP_UTF8
     ret
 
+; Fixed early/late dates make zero padding and field offsets deterministic.
+; Write SYSTEMTIME's eight WORD fields, including day-of-week between month/day.
 test_GetSystemTime:
     cmp dword [rel test_mode], 20
     je .early
@@ -103,6 +127,7 @@ test_GetSystemTime:
     mov word [rcx+14], 999
     ret
 
+; Handle-creation failure is -1 here, unlike NULL from CreateThread below.
 test_IcmpCreateFile:
     cmp dword [rel test_mode], 19
     je .fail
@@ -116,6 +141,8 @@ test_Icmp6CreateFile:
     je test_IcmpCreateFile.fail
     jmp Icmp6CreateFile
 
+; Supply oversized canonical names only for hostname lookups. AI_NUMERICHOST
+; must still reject nonnumeric input, preserving the resolver's two-stage logic.
 test_getaddrinfo:
     cmp dword [rel test_mode], 10
     jne .normal
@@ -132,6 +159,7 @@ test_getaddrinfo:
 .normal:
     jmp getaddrinfo
 
+; Static fixture results need no freeing; real Winsock results still do.
 test_freeaddrinfo:
     lea rax, [rel test_ai4]
     cmp rcx, rax
@@ -143,6 +171,8 @@ test_freeaddrinfo:
 .done:
     ret
 
+; Keep real numeric formatting, but control reverse lookup results to exercise
+; sanitization, fallback on missing names, and scoped IPv6 name matching.
 test_getnameinfo:
     test dword [rsp+38h], 2      ; numeric formatting uses the real Winsock API
     jnz .normal
@@ -193,6 +223,7 @@ test_CreateThread:
 .normal:
     jmp CreateThread
 
+; Mode 11 stops before the first probe, covering zero-sent statistics/cleanup.
 test_SetConsoleCtrlHandler:
     cmp dword [rel test_mode], 11
     jne .normal
@@ -210,6 +241,8 @@ test_IcmpCloseHandle:
 .close:
     jmp IcmpCloseHandle
 
+; Match the failures simulated by the send fixtures. Returning zero from a send
+; is only half of the API contract: the caller also needs the right error code.
 test_GetLastError:
     mov eax, 11010
     cmp dword [rel test_mode], 2
@@ -227,6 +260,9 @@ test_GetLastError:
 .done:
     ret
 
+; Build native reply structures directly in the caller's buffer, rather than
+; constructing network packets. Return 1 for a completed reply even when its
+; embedded IP_STATUS reports failure; return 0 for an API-level failure/pending.
 test_IcmpSendEcho2:
     ; Check alignment and the actual x64 API argument layout.
     mov rax, rsp
@@ -321,6 +357,9 @@ test_IcmpSendEcho2:
     mov byte [rel g_stop], 1
     jmp .fail
 
+; Validate the extra source argument, then shift stack slots into the non-Ex
+; layout and tail-jump to the shared reply generator. This modifies only the
+; outgoing argument area of the instrumented caller, not production code.
 test_IcmpSendEcho2Ex:
     ; An explicit IPv4 source must reach the source-address API argument.
     mov eax, [rel source_addr+4]
@@ -343,6 +382,9 @@ test_IcmpSendEcho2Ex:
     mov [rsp+58h], rax
     jmp test_IcmpSendEcho2
 
+; Check the worker's ABI/timeout contract before returning a native IPv6 reply.
+; Mode 12 blocks on a private unsignaled event to model a pending synchronous
+; worker; the interruption tests must still get main to exit promptly.
 test_Icmp6SendEcho2:
     ; The IPv6 worker makes a synchronous call so -w remains effective.
     mov rax, rsp
@@ -437,6 +479,9 @@ test_Icmp6SendEcho2:
     xor eax, eax
     ret
 
+; Modes 13/14 model zero-progress and failed writes; mode 15 caps each successful
+; write at two bytes. This exercises the caller's retry loop even when a UTF-8
+; glyph spans multiple writes. All other writes use the real output handle.
 test_WriteFile:
     cmp dword [rel test_mode], 13
     je .zero

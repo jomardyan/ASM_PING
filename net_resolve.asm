@@ -3,11 +3,38 @@
 ; canonname 24, sockaddr pointer 32, next 40. sockaddr_in = 16 bytes;
 ; sockaddr_in6 = 28 bytes (the final dword is the interface scope ID).
 
+; READING GUIDE
+; This is an include file, not a standalone program: main calls resolve_endpoints
+; after WSAStartup. It turns text into owned sockaddr buffers and printable names:
+;   optional numeric source -> numeric target attempt -> optional hostname lookup
+;   -> family checks -> copy addresses -> optional reverse lookup -> free results.
+; No ICMP packet is sent here. These synchronous lookups happen before the probe
+; loop, so the -w ICMP timeout does not limit DNS lookup time.
+;
+; Names and addresses are separate concepts: tgtbuf/source_text contain input
+; text; source_addr/dest_addr contain binary socket addresses; ipstr/source_ipstr
+; contain numeric display text; namebuf holds an owned, sanitized display name.
+; g_family_force is the explicit -4/-6 choice; g_family is the selected family.
+; Zero means "not chosen yet", AF_INET=2 means IPv4, AF_INET6=23 means IPv6 on
+; Windows. Family constants are API values, not the IP protocol version numbers.
+;
+; sockaddr_in fields: family +0 (WORD), port +2, four address bytes +4.
+; sockaddr_in6 fields: family +0, port +2, flow info +4, 16 address bytes +8,
+; numeric scope ID +24. Ports stay zero because ICMP has no TCP/UDP port.
+; Address bytes use network order; family and sockaddr scope use host order.
+; A scope such as %12 identifies the interface for an address like fe80::1%12.
+;
+; Win64 structure layouts include alignment padding. In ADDRINFOA, addrlen is
+; an 8-byte size_t, and each pointer is 8 bytes. The offsets above therefore
+; differ from 32-bit layouts even when a field's logical purpose is the same.
+
 extern getaddrinfo
 extern freeaddrinfo
 extern getnameinfo
 
 section .bss
+    ; ALIGNB reserves padding without emitting initialized bytes. Both address
+    ; slots hold the larger IPv6 form; IPv4 uses only the first 16 bytes.
     alignb 4
     g_family       resd 1
     g_family_force resd 1
@@ -22,6 +49,10 @@ section .text
 
 ; rcx = sockaddr, rdx = output buffer, r8d = buffer capacity.
 ; Returns getnameinfo status (zero on success). Preserves nonvolatile registers.
+; NI_NUMERICHOST prevents a reverse DNS query: this is only address-to-text
+; conversion, including an IPv6 scope suffix when needed. Reorder RCX/RDX/R8
+; into getnameinfo's first four arguments, then place the last three on stack.
+; Its final status is returned unchanged in EAX; local validation returns 1.
 format_address:
     test    r8d, r8d
     jz      .bad
@@ -50,6 +81,11 @@ format_address:
 ; Returns eax = 0/1 for valid/invalid; ecx = whether ':' occurred.
 ; Windows may also accept interface names, but this CLI deliberately requires
 ; an unambiguous decimal uint32 index and rejects empty or overflowing indices.
+; This helper only checks the suffix syntax and whether a colon appeared; it
+; does not validate the address itself. getaddrinfo does that next. RSI advances;
+; ECX is a second return value consumed by resolve_endpoints, not a C-style return.
+; Before value*10+digit, require value < 429496729, or equality with digit <= 5.
+; These are UINT32_MAX's quotient/remainder when divided by 10.
 validate_endpoint_scope:
     xor     ecx, ecx
 .scan:
@@ -98,8 +134,18 @@ validate_endpoint_scope:
 ; Returns eax: 0 success, 1 bad target, 2 bad source, 3 family mismatch.
 ; Preserves all Win64 nonvolatile registers except the program's RSI/RDI
 ; formatting convention. No addrinfo-owned pointers survive the return.
+; Inputs are the global target/source strings and option flags. Outputs are the
+; global family, two sockaddr buffers and display strings. A return of zero is
+; success (the opposite of the boolean success returned by some other helpers).
+;
+; getaddrinfo allocates a linked list owned by Winsock. This implementation uses
+; its first result, copies needed address/name data, and frees the whole list.
+; Never keep ai_addr or ai_canonname after freeaddrinfo. The saved list pointer is
+; cleared after every free so error cleanup cannot release it twice.
 resolve_endpoints:
     push    rbx
+    ; Entry RSP is 8 mod 16; PUSH RBX aligns it. 400 is a multiple of 16, leaving
+    ; calls aligned while reserving shadow space, stack arguments and locals.
     sub     rsp, 400
     ; [64..111] hints, [112] allocated list, [120] return status,
     ; [128] target contains colon, [136] numeric-target lookup,
@@ -129,6 +175,9 @@ resolve_endpoints:
     lea     rax, [rel namebuf]
     mov     [rel g_name], rax
 
+    ; Start with the original target as a safe display fallback. A canonical or
+    ; reverse name may replace its contents later, but g_name always points to
+    ; our namebuf, never to memory owned by a resolver result.
     cmp     byte [rel g_has_source], 0
     je      .target
     lea     rsi, [rel source_text]
@@ -138,6 +187,10 @@ resolve_endpoints:
     cmp     byte [rel source_text], 0
     je      .bad_source
     mov     dword [rsp+64], 4          ; AI_NUMERICHOST, AF_UNSPEC
+    ; A source is a numeric local address, not a hostname. AF_UNSPEC permits
+    ; either family for parsing; compare it with an explicit -4/-6 afterwards.
+    ; Successful parsing alone does not prove the address belongs to this host:
+    ; the ICMP send API reports an unusable source/interface when sending.
     lea     rcx, [rel source_text]
     xor     edx, edx
     lea     r8, [rsp+64]
@@ -156,6 +209,9 @@ resolve_endpoints:
     cmp     eax, AF_INET6
     jne     .bad_source
 .source_copy:
+    ; Verify ai_addrlen and ai_addr before copying. REP MOVSB consumes RCX bytes
+    ; from RSI to RDI and advances both cursors. With the ABI's clear direction
+    ; flag, the copy moves forwards. Store family before later calls clobber EAX.
     cmp     [rbx+16], rcx
     jb      .bad_source
     mov     rsi, [rbx+32]
@@ -194,6 +250,9 @@ resolve_endpoints:
     mov     dword [rsp+68], 0          ; AF_UNSPEC
     mov     dword [rsp+136], 1
 .query_target:
+    ; Pass a null service string (no port), hints on our stack, and the address
+    ; of a stack slot for the allocated result-list pointer. Status is returned
+    ; directly in EAX: getaddrinfo errors do not come from GetLastError.
     lea     rcx, [rel tgtbuf]
     xor     edx, edx
     lea     r8, [rsp+64]
@@ -211,6 +270,9 @@ resolve_endpoints:
     call    freeaddrinfo
     mov     qword [rsp+112], 0
 .hostname:
+    ; Retry nonnumeric text as a hostname, choosing family in this order:
+    ; explicit -4/-6, otherwise the source's family, otherwise IPv4. A failed
+    ; colon-containing target was already rejected as a malformed IPv6 literal.
     mov     eax, [rel g_family_force]
     test    eax, eax
     jnz     .family_chosen
@@ -236,6 +298,9 @@ resolve_endpoints:
     cmp     eax, AF_INET6
     jne     .bad_target
 .target_family:
+    ; Numeric parsing initially accepted either family, allowing a clear mismatch
+    ; diagnostic for -4 ::1. Now enforce explicit family and source compatibility
+    ; before selecting the API or sending a packet.
     cmp     [rbx+16], rcx
     jb      .bad_target
     mov     edx, [rel g_family_force]
@@ -259,6 +324,8 @@ resolve_endpoints:
     jne     .canonical
     mov     eax, [rel g_family]
     mov     [rel source_addr], ax      ; unspecified address of selected family
+    ; The remaining zero address bytes request OS source selection when the
+    ; user omitted -S. An explicit source was copied earlier and is left intact.
 .canonical:
     mov     rsi, [rbx+24]
     test    rsi, rsi
@@ -268,6 +335,8 @@ resolve_endpoints:
     lea     rdi, [rel namebuf]
     call    append_name
 .free_target:
+    ; dest_addr/namebuf now own their copies. Release the lookup result before
+    ; formatting or reverse lookup, so later failures cannot strand its memory.
     mov     rcx, [rsp+112]
     call    freeaddrinfo
     mov     qword [rsp+112], 0
@@ -285,6 +354,9 @@ resolve_endpoints:
     je      .reverse
     mov     edx, 28
 .reverse:
+    ; -a asks for a name once, not on every reply. NI_NAMEREQD reports failure
+    ; instead of substituting numeric text; on failure keep the existing name.
+    ; Copy/sanitize the successful temporary result before its stack frame ends.
     lea     r8, [rsp+144]
     mov     r9d, 256
     mov     qword [rsp+32], 0
@@ -310,6 +382,8 @@ resolve_endpoints:
 .mismatch:
     mov     eax, 3
 .finish:
+    ; Preserve our status across freeaddrinfo, which may overwrite volatile EAX.
+    ; This common exit releases any list still owned after an early error.
     mov     [rsp+120], eax
     mov     rcx, [rsp+112]
     test    rcx, rcx
