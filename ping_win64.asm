@@ -139,8 +139,8 @@ section .data
     ; ---- classic plain output strings ----
     s_pinging  db "Pinging ", 0
     s_lb       db " [", 0
-    s_rb_with  db "] with ", 0
-    s_bytesdat db " bytes of data:", 13, 10, 13, 10, 0
+    s_with     db " with ", 0
+    s_bytesdat db " bytes of data:", 13, 10, 0
     s_reply    db "Reply from ", 0
     s_rb_col   db "]: bytes=", 0
     s_colon_b  db ": bytes=", 0
@@ -154,8 +154,9 @@ section .data
     s_spc      db " ", 0
     s_nl       db 13, 10, 0
     s_colon_nl db ":", 13, 10, 0
-    s_stat1    db "Ping statistics for ", 0
-    s_pkts     db 13, 10, "    Packets: Sent = ", 0
+    ; As in Windows ping, the blank line precedes the statistics heading.
+    s_stat1    db 13, 10, "Ping statistics for ", 0
+    s_pkts     db "    Packets: Sent = ", 0
     s_recv     db ", Received = ", 0
     s_lost     db ", Lost = ", 0
     s_pct      db " (", 0
@@ -181,7 +182,6 @@ section .data
     s_badopt   db "error: unknown option ", 0
     s_badval   db "error: invalid or missing option value", 13, 10, 0
     s_duptgt   db "error: only one target allowed", 13, 10, 0
-    s_dot      db ".", 0
     s_usage    db "usage: ping [-t] [-a] [-n count] [-l size] [-f] [-i ttl] [-v tos]", 13, 10
                db "            [-r count] [-w timeout] [-4|-6] [-S source] [--flood]", 13, 10
                db "            [--interval ms] [--quiet] [--timestamp] target", 13, 10, 13, 10
@@ -215,7 +215,7 @@ section .data
     s_timestampopt db "--timestamp", 0
     s_sourceopt db "--source", 0
     s_floodtag db " | flood", 0
-    s_floodmsg db "Flood mode: no interval between requests.", 13, 10, 13, 10, 0
+    s_floodmsg db "Flood mode: no interval between requests.", 13, 10, 0
     s_intervaltag db " | interval ", 0
     s_intervalmsg db "Request interval: ", 0
     timestamp_text db "[0000-00-00T00:00:00.000Z] ", 0
@@ -245,6 +245,7 @@ section .data
     m_hoplimit db "Hop limit expired in transit.", 0
     m_scope    db "IPv6 scope mismatch.", 0
     m_fail     db "Transmit failed, error ", 0
+    m_badsrc   db "Transmit failed: source address is not usable on this machine.", 0
     s_ellipsis db "...", 0
     s_spaces   times TBL_W db ' '
     envname    db "PING_PRETTY", 0
@@ -310,10 +311,8 @@ section .bss
     ; Request and reply storage is static because Windows/a worker can still be
     ; using it when Ctrl+C takes the main thread to statistics and process exit.
     sendbuf    resb 65536
-    ; Native x64 IPv4 ICMP_ECHO_REPLY offsets used below:
-    ; address +0, status +4, RTT +8 (DWORDs); data size +12 (WORD);
-    ; data pointer +16; options TTL/TOS/flags/size +24..27; options pointer +32.
-    ; These are Windows API structures, not the wire-format ICMP packet header.
+    ; Windows API reply structures (not wire-format packets); their field
+    ; offsets are listed once, beside normalize_reply.
     replybuf   resb REPLY_CAP
     reply6buf  resb REPLY_CAP
     reply_addr resb 28
@@ -326,8 +325,6 @@ section .bss
     ; padding at +4..7, then an 8-byte OptionsData pointer at +8.
     optinfo    resb 16
     routedata  resb 44
-    ip_scr     resb 4
-    route_scr  resb 4
     numbuf     resb 32
     tgtbuf     resb 256
     namebuf    resb 256
@@ -580,6 +577,14 @@ main:
     je      .opt_tos
     cmp     al, 'r'
     je      .opt_rr
+    ; Windows ping's -j/-k/-s take values, so report them as unsupported even
+    ; with an attached value (-s4) instead of as an unknown option.
+    cmp     al, 'j'
+    je      .unsup
+    cmp     al, 'k'
+    je      .unsup
+    cmp     al, 's'
+    je      .unsup
     ; Only numeric options accept attached values (-n4). Flags must be exact.
     cmp     byte [rcx+2], 0
     jne     .badopt
@@ -597,12 +602,6 @@ main:
     je      .help
     cmp     al, '6'
     je      .opt_ipv6
-    cmp     al, 'j'
-    je      .unsup
-    cmp     al, 'k'
-    je      .unsup
-    cmp     al, 's'
-    je      .unsup
     jmp     .badopt
 
 .long_opt:
@@ -914,7 +913,8 @@ main:
     mov     edx, B_TR
     mov     ecx, TBL_W
     call    box_hline
-    ; line 1: "PING <name> [<ip>]"
+    ; line 1: "PING <name> [<ip>]"; a numeric target whose name is the same
+    ; text as its address is shown once, without the bracketed repeat.
     lea     r15, [rel hdr1]
     lea     rsi, [rel s_pingcaps]
     mov     rdi, r15
@@ -924,6 +924,11 @@ main:
     mov     rdi, r15
     call    append_str
     mov     r15, rax
+    mov     rcx, [rel g_name]
+    lea     rdx, [rel ipstr]
+    call    option_equal
+    test    eax, eax
+    jnz     .hdr_name_done
     lea     rsi, [rel s_lb]
     mov     rdi, r15
     call    append_str
@@ -935,6 +940,7 @@ main:
     lea     rsi, [rel s_rb]
     mov     rdi, r15
     call    append_str
+.hdr_name_done:
     lea     rcx, [rel hdr1]
     mov     edx, TBL_W
     call    box_line
@@ -1000,16 +1006,27 @@ main:
     call    print_sz
     mov     rcx, [rel g_name]
     call    print_sz
+    ; Like Windows ping, omit " [address]" when the name is that same address.
+    mov     rcx, [rel g_name]
+    lea     rdx, [rel ipstr]
+    call    option_equal
+    test    eax, eax
+    jnz     .hdr_plain_with
     lea     rcx, [rel s_lb]
     call    print_sz
     lea     rcx, [rel ipstr]
     call    print_sz
-    lea     rcx, [rel s_rb_with]
+    lea     rcx, [rel s_rb]
+    call    print_sz
+.hdr_plain_with:
+    lea     rcx, [rel s_with]
     call    print_sz
     mov     eax, [rel g_size]
     call    print_dec
     lea     rcx, [rel s_bytesdat]
     call    print_sz
+    ; Optional configuration lines stay attached to the header; one blank line
+    ; then separates the whole header from the per-probe results.
     cmp     byte [rel g_has_source], 0
     je      .hdr_plain_source_done
     lea     rcx, [rel s_source]
@@ -1023,16 +1040,17 @@ main:
     je      .hdr_plain_interval
     lea     rcx, [rel s_floodmsg]
     call    print_sz
-    jmp     .hdr_done
+    jmp     .hdr_plain_end
 .hdr_plain_interval:
     cmp     qword [rel g_interval], 1000
-    je      .hdr_done
+    je      .hdr_plain_end
     lea     rcx, [rel s_intervalmsg]
     call    print_sz
     mov     rax, [rel g_interval]
     call    print_dec
     lea     rcx, [rel s_ms_nl]
     call    print_sz
+.hdr_plain_end:
     lea     rcx, [rel s_nl]
     call    print_sz
 .hdr_done:
@@ -1355,9 +1373,6 @@ main:
     jbe     .nomax
     mov     [rel g_max], eax
 .nomax:
-    ; Keep RTT totals even in quiet mode: rendering is skipped only after the
-    ; counters/min/max/sum have been updated. An RTT of 0 means below 1 ms at
-    ; this API's resolution, which the renderer displays as "<1ms".
     mov     rcx, [rel g_sum]
     add     rcx, rax
     mov     [rel g_sum], rcx
@@ -1550,6 +1565,13 @@ main:
     je      .m_gf
     cmp     eax, 11009
     je      .m_frag
+    ; ERROR_INVALID_NETNAME (1214) is how Windows rejects an explicit source
+    ; address that is not assigned to a local interface.
+    cmp     eax, 1214
+    jne     .app_msg
+    cmp     byte [rel g_has_source], 0
+    je      .app_msg
+    lea     r13, [rel m_badsrc]
     jmp     .app_msg
 .m_to:
     lea     r13, [rel m_timeout]
@@ -1717,7 +1739,6 @@ main:
     ; Lost
     mov     rax, r14
     sub     rax, r15
-    mov     r13, rax
     lea     rdi, [rel valbuf]
     call    append_dec
     lea     rcx, [rel s_m_lost]
@@ -1809,7 +1830,6 @@ main:
     call    print_sz
     mov     rax, r14
     sub     rax, r15
-    mov     r13, rax
     call    print_dec
     lea     rcx, [rel s_pct]
     call    print_sz
@@ -2005,13 +2025,21 @@ normalize_reply:
     mov     [rel reply_addr+16], rdx
     mov     ecx, [rel reply6buf+22]
     bswap   ecx                  ; IPV6_ADDRESS_EX scope uses network byte order
-    mov     [rel reply_addr+24], ecx
     cmp     rax, [rel dest_addr+8]
-    jne     .ipv6_fields
+    jne     .ipv6_scope
     cmp     rdx, [rel dest_addr+16]
-    jne     .ipv6_fields
+    jne     .ipv6_scope
+    ; Windows can return scope 0 for a reply from a scoped (link-local) target.
+    ; When the address bytes match the destination, inherit its scope so the
+    ; reply prints as fe80::1%12 and still matches the target for -a.
+    test    ecx, ecx
+    jnz     .ipv6_match
+    mov     ecx, [rel dest_addr+24]
+.ipv6_match:
     cmp     ecx, [rel dest_addr+24]
     sete    byte [rel g_reply_is_target]
+.ipv6_scope:
+    mov     [rel reply_addr+24], ecx
 .ipv6_fields:
     ; Populate just the common scalar fields used by stats/rendering. The IPv4
     ; options area remains untouched, and IPv6 rendering never reads its TTL.
@@ -2156,51 +2184,6 @@ parse_u32:                          ; rcx = asciiz -> rax = value, edx = 0/1
     ret
 .bad:
     mov     edx, 1
-    ret
-
-; Standalone dotted-quad helper; endpoint setup currently uses getaddrinfo in
-; net_resolve.asm instead. Requires exactly four nonempty decimal octets, each
-; <=255, separated by dots and followed immediately by NUL. Leading zeros are
-; decimal here. Advances RSI; clobbers volatile registers. EDX is valid only
-; when EAX=1. Build octets numerically, then BSWAP so storing EDX gives network
-; byte order in little-endian memory (e.g. 127.0.0.1 -> bytes 7f 00 00 01).
-parse_ip4:                          ; rsi = asciiz -> rax = 1, edx = ip / rax = 0
-    xor     edx, edx
-    mov     r8d, 4
-.octet:
-    xor     ecx, ecx
-    xor     r9d, r9d
-.digit:
-    movzx   eax, byte [rsi]
-    sub     al, '0'
-    cmp     al, 9
-    ja      .digit_end
-    imul    ecx, ecx, 10
-    add     ecx, eax
-    cmp     ecx, 255
-    ja      .fail
-    inc     rsi
-    inc     r9d
-    jmp     .digit
-.digit_end:
-    test    r9d, r9d
-    jz      .fail
-    imul    edx, edx, 256
-    add     edx, ecx
-    dec     r8d
-    jz      .done
-    cmp     byte [rsi], '.'
-    jne     .fail
-    inc     rsi
-    jmp     .octet
-.done:
-    cmp     byte [rsi], 0
-    jne     .fail
-    bswap   edx
-    mov     eax, 1
-    ret
-.fail:
-    xor     eax, eax
     ret
 
 ; ---------- string helpers ----------
@@ -2607,29 +2590,6 @@ print_dec:                          ; rax = unsigned value
     sub     rdx, rcx
     call    ws_print_raw
     add     rsp, 28h
-    ret
-
-; Direct-output counterpart to ip_str, currently unused by the main path. Keep
-; the byte cursor/end in saved R13/R14 across calls that clobber volatile registers.
-print_ip:                           ; rcx = ptr to 4 bytes (network order)
-    push    r13
-    push    r14
-    sub     rsp, 28h
-    mov     r13, rcx
-    lea     r14, [rcx + 3]
-.oct:
-    movzx   eax, byte [r13]
-    call    print_dec
-    inc     r13
-    cmp     r13, r14
-    ja      .ipend
-    lea     rcx, [rel s_dot]
-    call    print_sz
-    jmp     .oct
-.ipend:
-    add     rsp, 28h
-    pop     r14
-    pop     r13
     ret
 
 ; Table entries are 8-byte pointers, hence index*8. Both lookup helpers tail-jump

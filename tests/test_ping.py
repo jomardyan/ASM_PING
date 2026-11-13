@@ -282,12 +282,55 @@ class PingTests(unittest.TestCase):
         self.assertNotIn('Reply from ', p.stdout)
 
     def test_scoped_ipv6_reply_formatting_and_reverse_name_match(self):
-        p = run_ping(['-6', '-a', '-Sfe80::1%12', '-n1', 'fe80::1%12'],
-                     exe=self.mock, mode=29)
+        # Mode 29 echoes the target's scope; mode 30 returns scope 0, as Windows
+        # does for a link-local target, and the reply must inherit the scope.
+        for mode in (29, 30):
+            with self.subTest(mode=mode):
+                p = run_ping(['-6', '-a', '-Sfe80::1%12', '-n1', 'fe80::1%12'],
+                             exe=self.mock, mode=mode)
+                self.assertEqual(p.returncode, 0, p.stdout)
+                self.assertIn('Source address: fe80::1%12', p.stdout)
+                self.assertIn('Reply from scoped-test [fe80::1%12]: bytes=32 time=23ms',
+                              p.stdout)
+                self.assertNotIn('TTL=', p.stdout)
+        p = run_ping(['-6', '-n1', 'fe80::1%12'], exe=self.mock, mode=30)
         self.assertEqual(p.returncode, 0, p.stdout)
-        self.assertIn('Source address: fe80::1%12', p.stdout)
-        self.assertIn('Reply from scoped-test [fe80::1%12]: bytes=32 time=23ms', p.stdout)
-        self.assertNotIn('TTL=', p.stdout)
+        self.assertIn('Reply from fe80::1%12: bytes=32', p.stdout)
+
+    def test_plain_header_and_statistics_layout(self):
+        p = run_ping(['-n1', '127.0.0.1'])
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertTrue(p.stdout.startswith(
+            'Pinging 127.0.0.1 with 32 bytes of data:\n\nReply from '), p.stdout)
+        self.assertRegex(p.stdout, r'TTL=\d+\n\nPing statistics for 127\.0\.0\.1:\n'
+                                   r'    Packets: Sent = 1,')
+        p = run_ping(['-n1', '::1'])
+        self.assertTrue(p.stdout.startswith('Pinging ::1 with 32 bytes'), p.stdout)
+        p = run_ping(['-4', '-n1', 'localhost'])
+        self.assertRegex(p.stdout, r'^Pinging \S+ \[127\.0\.0\.1\] with 32 bytes')
+        p = run_ping(['-S', '127.0.0.1', '--flood', '-n1', '127.0.0.1'])
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertTrue(p.stdout.startswith(
+            'Pinging 127.0.0.1 with 32 bytes of data:\n'
+            'Source address: 127.0.0.1\n'
+            'Flood mode: no interval between requests.\n\nReply from '), p.stdout)
+        p = run_ping(['-n1', '127.0.0.1'], pretty='1')
+        self.assert_table(p.stdout)
+        self.assertNotIn('[127.0.0.1]', p.stdout)
+
+    def test_unusable_source_address_message(self):
+        for pretty in (None, '1'):
+            with self.subTest(pretty=pretty):
+                p = run_ping(['-S', '127.0.0.1', '-n1', '127.0.0.1'],
+                             exe=self.mock, mode=31, pretty=pretty)
+                self.assertEqual(p.returncode, 1, p.stdout)
+                self.assertIn('source address is not usable', p.stdout)
+                self.assertNotIn('1214', p.stdout)
+                if pretty:
+                    self.assert_table(p.stdout)
+        p = run_ping(['-n1', '127.0.0.1'], exe=self.mock, mode=31)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn('Transmit failed, error 1214', p.stdout)
 
     def test_failures_have_failure_exit_code(self):
         p = run_ping(['-n1', '-w1', '0.0.0.0'])
@@ -317,6 +360,11 @@ class PingTests(unittest.TestCase):
                 p = run_ping([flag, '127.0.0.1'])
                 self.assertEqual(p.returncode, 2)
                 self.assertNotIn('\x00', p.stdout)
+        for flag in ('-j', '-k', '-s', '-R', '-s4', '-j1', '/k9'):
+            with self.subTest(unsupported=flag):
+                p = run_ping([flag, '127.0.0.1'])
+                self.assertEqual(p.returncode, 2)
+                self.assertIn('option not supported', p.stdout)
 
     def test_invalid_targets_and_duplicates(self):
         for target in ('', 'a' * 256, 'b' * 20000, 'bad host', '\x1b[31m', 'h\u00f4st'):

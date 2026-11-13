@@ -180,6 +180,8 @@ test_getnameinfo:
     je .missing
     cmp dword [rel test_mode], 29
     je .scoped
+    cmp dword [rel test_mode], 30
+    je .scoped
     cmp dword [rel test_mode], 10
     jne .normal
     ; Return a full-sized reverse name including a control character. The
@@ -256,6 +258,9 @@ test_GetLastError:
     mov eax, 997
     cmp dword [rel test_mode], 12
     je .done
+    mov eax, 1214                ; ERROR_INVALID_NETNAME: unusable source address
+    cmp dword [rel test_mode], 31
+    je .done
     jmp GetLastError
 .done:
     ret
@@ -292,6 +297,8 @@ test_IcmpSendEcho2:
     cmp eax, 4
     je .fail
     cmp eax, 12
+    je .fail
+    cmp eax, 31
     je .fail
     cmp eax, 18
     je .nine_hops
@@ -430,6 +437,11 @@ test_Icmp6SendEcho2:
     mov [r10+14], rax
     mov eax, [r11+24]
     bswap eax
+    ; Mode 30 models real Windows returning scope 0 for a scoped target's reply.
+    cmp dword [rel test_mode], 30
+    jne .store_scope
+    xor eax, eax
+.store_scope:
     mov [r10+22], eax
     mov dword [r10+28], 0
     mov dword [r10+32], 23
