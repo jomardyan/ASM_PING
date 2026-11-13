@@ -14,6 +14,9 @@
 ; Windows supplies the command line, console/file I/O, name resolution and ICMP.
 ; The program asks Windows to build/send ICMP packets; it does not use raw sockets
 ; or manually calculate their checksums.
+; IPv4 uses event-driven IcmpSendEcho2/Ex requests. IPv6 uses a blocking
+; Icmp6SendEcho2 worker so main can wait for completion or cancellation.
+; normalize_reply exposes common status/RTT/size fields for both paths.
 ;
 ; Follow main in this order:
 ;   console setup -> argument parsing -> resolve_endpoints -> request setup
@@ -22,6 +25,7 @@
 ; routines and globals belong to the same object file and share these constants.
 ;
 ; NASM notation used throughout:
+;   EQU defines an assembly-time constant; DB/DW/DD/DQ emit 1/2/4/8-byte values.
 ;   [address] accesses memory; LEA computes an address without reading its bytes.
 ;   byte/word/dword/qword mean 1/2/4/8 bytes; 28h and 0x28 both mean hexadecimal.
 ;   A .local label belongs to the preceding non-local label: main.loop and
@@ -46,7 +50,9 @@
 ; automatic decompiler may infer incorrect parameters or even a void return.
 ; The main probe loop keeps its ICMP handle in RBX, IPv4 destination in R12D,
 ; sent count in R14 and received count in R15. Helpers preserve those live values
-; when borrowing their registers. main exits the process rather than returning.
+; when borrowing their registers. R13 is scratch for rendering/error selection;
+; before the loop, some of these registers serve as temporary string cursors.
+; main exits the process rather than returning.
 
 ; Prefer RIP-relative memory operands so code can run at a relocated image base.
 ; Absolute pointers stored in DQ tables still need PE loader relocations.
@@ -56,6 +62,10 @@ global main
 
 ; EXTERN declares a symbol for the linker, not a function prototype. Argument
 ; order, structure layout, stack space and error checks are our responsibility.
+; Imports are linked from the .def files in build/. kernel32 supplies console,
+; process, time, and synchronization services; shell32 splits the Unicode command
+; line; iphlpapi implements ICMP; ws2_32 initializes Winsock for the resolver.
+; The program uses these APIs directly, without malloc, printf, or a C runtime.
 extern GetStdHandle             ; kernel32
 extern WriteFile
 extern ExitProcess
@@ -90,6 +100,8 @@ extern WSACleanup
 
 MAX_PAYLOAD  equ 65500
 REPLY_CAP    equ 65624          ; native x64 reply (40) + payload + 40 IP options + 8 error bytes
+; REPLY_CAP leaves additional slack: the listed maximum components total 65588.
+; TOKEN_CAP is a UTF-8 byte capacity; conversion fails if an argv token exceeds it.
 TOKEN_CAP    equ 32768
 IP_FLAG_DF   equ 2
 AF_INET      equ 2
@@ -122,6 +134,8 @@ C_BOLD   equ 5
 ; 64-bit values/pointers, and TIMES repeats a declaration. Strings here end in
 ; zero; 13,10 is the Windows CR/LF newline. WriteFile itself needs a byte length.
 section .data
+    ; Combining small fragments keeps plain and table renderers on the same
+    ; values; print_sz excludes the terminating zero from WriteFile's byte count.
     ; ---- classic plain output strings ----
     s_pinging  db "Pinging ", 0
     s_lb       db " [", 0
@@ -234,7 +248,8 @@ section .data
     s_ellipsis db "...", 0
     s_spaces   times TBL_W db ' '
     envname    db "PING_PRETTY", 0
-    ; ANSI escapes
+    ; ANSI escapes: ESC [ ... m selects text attributes. Color output is enabled
+    ; only after VT setup succeeds, or when PING_PRETTY=1 forces UTF-8/ANSI output.
     e_reset  db 27, "[0m", 0
     e_green  db 27, "[32m", 0
     e_red    db 27, "[31m", 0
@@ -242,7 +257,9 @@ section .data
     e_yellow db 27, "[33m", 0
     e_bold   db 27, "[1m", 0
     escset   dq e_reset, e_green, e_red, e_cyan, e_yellow, e_bold
-    ; box charsets: CP437 (legacy console) and UTF-8 (CP 65001)
+    ; Box charsets: each table contains eleven pointers, indexed by B_* above.
+    ; CP437/850 use single-byte glyphs; CP_UTF8 uses three-byte sequences for the
+    ; same one-column glyphs. Other console code pages use the ASCII fallback.
     c437_h  db 0C4h, 0
     c437_v  db 0B3h, 0
     c437_tl db 0DAh, 0
@@ -273,10 +290,10 @@ section .data
     ca_v db '|', 0
     ca_c db '+', 0
     setascii dq ca_h, ca_v, ca_c, ca_c, ca_c, ca_c, ca_c, ca_c, ca_c, ca_c, ca_c
-    ; Column widths include the spaces around each cell, but exclude borders.
-    ; Five columns therefore need six border glyphs: 12+30+7+16+9+6 = 80.
+    ; Column widths include each cell's leading/trailing spaces, but exclude
+    ; borders. Main: 74 cell columns + 6 borders = 80. Statistics: 77 + 3 = 80.
+    ; colw_span merges the five main columns into one cell for errors/routes.
     ; Widths count displayed ASCII content; UTF-8 border glyphs use more bytes.
-    ; column layouts
     colw_main  db 12, 30, 7, 16, 9       ; #, From, Size, Time, TTL (total 80)
     colw_span  db TBL_W-2
     colw_stats db 24, TBL_W-27
@@ -286,8 +303,12 @@ section .data
 ; Static storage also outlives asynchronous requests. Only one probe is active
 ; at a time; the formatting scratch buffers are not designed for concurrent use.
 section .bss
+    ; The loader zeroes all of .bss. Zero handles/flags therefore also mean
+    ; "not acquired" during early-error cleanup; no separate memset is needed.
     hstdout    resq 1
-    written    resq 1
+    written    resq 1              ; WriteFile writes a DWORD into this reservation
+    ; Request and reply storage is static because Windows/a worker can still be
+    ; using it when Ctrl+C takes the main thread to statistics and process exit.
     sendbuf    resb 65536
     ; Native x64 IPv4 ICMP_ECHO_REPLY offsets used below:
     ; address +0, status +4, RTT +8 (DWORDs); data size +12 (WORD);
@@ -301,6 +322,8 @@ section .bss
     g_worker_result resd 1
     g_worker_error resd 1
     wsadata    resb 408
+    ; Native x64 IP_OPTION_INFORMATION: byte TTL/TOS/Flags/OptionsSize at +0..3,
+    ; padding at +4..7, then an 8-byte OptionsData pointer at +8.
     optinfo    resb 16
     routedata  resb 44
     ip_scr     resb 4
@@ -309,12 +332,16 @@ section .bss
     tgtbuf     resb 256
     namebuf    resb 256
     tokenbuf   resb TOKEN_CAP
+    ; CommandLineToArgvW owns a single allocation referenced by g_argv until
+    ; LocalFree. next_token overwrites tokenbuf, so retained tokens are copied.
     g_argv     resq 1
     g_argc     resd 1
     g_argidx   resd 1
     g_argerror resb 1
     ; Acquisition flags and initially-null handles let cleanup handle failures
     ; at any setup stage, including help/usage exits before networking starts.
+    ; g_pending means an ICMP operation may still use its handle, event and reply
+    ; buffer, so cleanup must leave those resources to ExitProcess.
     g_wsa      resb 1
     g_conchanged resb 1
     g_ctrl     resb 1
@@ -329,6 +356,8 @@ section .bss
     conmode    resd 1
     envbuf     resb 8
     g_name     resq 1
+    ; Counts, sizes, and times use qword storage even where the API consumes only
+    ; a WORD or DWORD. CLI validation keeps each value inside that API's range.
     g_count    resq 1
     g_size     resq 1
     g_timeout  resq 1
@@ -347,11 +376,15 @@ section .bss
     g_rr       resq 1
     g_stop     resb 1
     g_optptr   resq 1
+    ; Successful RTTs only: min/max are compared as DWORDs, sum is a qword.
+    ; g_min starts at all ones so the first successful RTT always replaces it.
     g_min      resq 1
     g_max      resq 1
     g_sum      resq 1
     g_pretty   resb 1
     g_color    resb 1
+    ; Rendering state: selected glyph pointers, current width array, and up to
+    ; five NUL-terminated cell strings. Buffers below hold the formatted values.
     boxset     resq 11
     g_colw     resq 1
     g_ncols    resq 1
@@ -369,9 +402,9 @@ section .bss
 
 section .text
 main:
-    ; Entry RSP is 8 bytes off a 16-byte boundary. Subtracting 78h restores call
-    ; alignment and leaves room for the largest API call plus temporary values.
-    ; Stack argument slots are reused as scratch only when not needed by a call.
+    ; Entry RSP is 8 modulo 16. Subtracting 78h aligns calls and provides shadow
+    ; space, arguments 5..12 at +20h..+58h, and spare local storage. Those outgoing
+    ; slots are reused as error-formatting temporaries only after an API returns.
     sub     rsp, 78h              ; shadow space, twelve API arguments, locals
 
     ; defaults
@@ -387,9 +420,10 @@ main:
     mov     [rel hstdout], rax
 
     ; ---- pretty-mode detection ----
-    ; GetConsoleMode distinguishes a console from redirected output. For a real
-    ; console, save its mode and use colors only if VT was accepted. PING_PRETTY=1
-    ; can force colors in redirected output. Encoding is a separate decision.
+    ; GetConsoleMode identifies a real console and saves its mode for cleanup.
+    ; Enable console colors only if VT was accepted. Redirected output stays
+    ; plain unless PING_PRETTY is exactly "1", which forces tables and colors.
+    ; Encoding is a separate decision; the console code page is never changed.
     mov     rcx, [rel hstdout]
     lea     rdx, [rel conmode]
     call    GetConsoleMode
@@ -433,6 +467,8 @@ main:
     lea     rsi, [rel setutf8]
     jmp     .fillset
 .fillset:
+    ; Copy eleven glyph pointers, not glyph bytes. Renderers can then use a
+    ; single lookup path regardless of UTF-8, legacy, or ASCII output encoding.
     lea     rdi, [rel boxset]
     mov     ecx, 11
     rep movsq
@@ -441,9 +477,12 @@ main:
 .pretty_done:
 
     ; ---- parse arguments ----
-    ; Use Windows' Unicode tokenizer instead of splitting on spaces ourselves:
-    ; quoted paths and arguments must stay intact. next_token converts one argv
-    ; entry to UTF-8 in a reusable buffer. LocalFree later releases the argv block.
+    ; Windows supplies one UTF-16 command-line string. CommandLineToArgvW handles
+    ; quotes and executable paths; next_token converts one argument to UTF-8.
+    ; Options may appear before or after the sole target. Each parser branch
+    ; validates its input before committing it to g_* configuration storage.
+    ; tokenbuf is reusable; copy text that must survive the next token. LocalFree
+    ; later releases the argv block allocated by CommandLineToArgvW.
     call    GetCommandLineW
     mov     rcx, rax
     lea     rdx, [rel g_argc]
@@ -509,7 +548,9 @@ main:
     mov     byte [rdi], 0
     jmp     .argloop
 .opt:
-    ; Match uppercase -S before folding ordinary short options to lowercase.
+    ; Short switches accept '-' or '/'. Preserve case long enough to distinguish
+    ; uppercase -S (source) and -R (unsupported) from other short options, then
+    ; fold ordinary ASCII letters to lowercase. Long switches are case-sensitive.
     ; Numeric short options may carry their value (-n4); flags must end here.
     cmp     word [rcx], 2D2Dh       ; exact long options start with "--"
     je      .long_opt
@@ -567,6 +608,7 @@ main:
 .long_opt:
     ; Whole-string comparison makes --flood exact and case-sensitive. It also
     ; rejects suffixes and --name=value, rather than accepting partial matches.
+    ; option_equal preserves RCX/RDX so each comparison sees the original token.
     lea     rdx, [rel s_floodopt]
     call    option_equal
     test    eax, eax
@@ -589,6 +631,8 @@ main:
     jnz     .opt_source_long
     jmp     .badopt
 .opt_ipv4:
+    ; An explicit family choice cannot contradict an earlier -4/-6. Source and
+    ; target family conflicts are checked later by resolve_endpoints.
     cmp     dword [rel g_family_force], AF_INET6
     je      .familyerr
     mov     dword [rel g_family_force], AF_INET
@@ -604,6 +648,8 @@ main:
 .opt_source_long:
     call    next_token
 .source_value:
+    ; This initial copy accepts printable ASCII only. The resolver subsequently
+    ; requires a numeric address and validates an optional decimal IPv6 %scope.
     test    rax, rax
     jz      .badsource
     mov     rcx, rax
@@ -653,12 +699,17 @@ main:
     mov     byte [rel g_quiet], 1
     jmp     .argloop
 .opt_timestamp:
+    ; A timestamp belongs to a plain per-probe record, so this option also turns
+    ; off tables/colors even if console detection or PING_PRETTY enabled them.
     mov     byte [rel g_timestamp], 1
     mov     byte [rel g_pretty], 0  ; timestamped records are plain text logs
     mov     byte [rel g_color], 0
     jmp     .argloop
 
 .opt_count:
+    ; Numeric switches share get_val (-n4 or -n 4) and overflow-checked parse_u32.
+    ; EDX reports parse failure separately from EAX, since zero is a valid size
+    ; or TOS value but is invalid for count, timeout, TTL, or record-route count.
     call    get_val
     test    rax, rax
     jz      .badval
@@ -753,6 +804,8 @@ main:
     call    print_sz
     jmp     .exit0
 .badopt:
+    ; Sanitize an unrecognized token before echoing it to the terminal, just as
+    ; resolver-provided names are bounded/sanitized before they are displayed.
     lea     rsi, [rel tokenbuf]
     lea     rdi, [rel frombuf]
     call    append_name
@@ -798,6 +851,8 @@ main:
 .args_done:
     ; Request Winsock 2.2 (0202h). WSAStartup returns its error code directly;
     ; unlike many Win32 APIs, a nonzero result means failure here.
+    ; Record success before resolution can fail, so cleanup balances it with
+    ; exactly one WSACleanup.
     cmp     byte [rel g_hastgt], 0
     je      .noarg
     mov     ecx, 0202h
@@ -808,6 +863,9 @@ main:
     mov     byte [rel g_wsa], 1
 
     ; Resolve both endpoints once, before creating an ICMP handle.
+    ; Return codes: 0 success, 1 target failure, 2 source failure, 3 family clash.
+    ; Results are copied into static sockaddr buffers; no addrinfo pointer is
+    ; retained. g_name points to sanitized namebuf and ipstr holds numeric text.
     call    resolve_endpoints
     cmp     eax, 2
     je      .badsource
@@ -816,6 +874,8 @@ main:
     test    eax, eax
     jnz     .nohost
     mov     r12d, [rel dest_addr+4]
+    ; sockaddr_in puts the network-order IPv4 bytes at +4. R12D is only used on
+    ; the IPv4 path; IPv6 instead passes the complete 28-byte sockaddr_in6.
     cmp     dword [rel g_family], AF_INET6
     jne     .resolved
     cmp     byte [rel g_df], 0
@@ -843,6 +903,9 @@ main:
 .resolved:
 
     ; ---- header ----
+    ; Build the table's title/configuration lines with advancing string cursors.
+    ; The plain path emits the same configuration as smaller output fragments.
+    ; --quiet suppresses probe rows later; the header and final stats still print.
     cmp     byte [rel g_pretty], 0
     je      .hdr_plain
     mov     rax, C_CYAN
@@ -975,10 +1038,10 @@ main:
 .hdr_done:
 
     ; ---- ICMP handle + Ctrl+C handler ----
-    ; ICMP creation fails with INVALID_HANDLE_VALUE (-1); event/thread creation
-    ; instead fails with NULL. Check the sentinel specified by each API.
-    ; Manual-reset events stay signaled until explicitly reset. The stop event
-    ; stays set after interruption; the reply event is reset before each probe.
+    ; ICMP handle creation fails with INVALID_HANDLE_VALUE (-1), whereas the
+    ; event/thread APIs fail with NULL. Two manual-reset events stay signaled
+    ; until explicitly reset: stop is permanent, reply is reset for each probe.
+    ; Their adjacent handle slots form the array passed to the multiple wait.
     cmp     dword [rel g_family], AF_INET6
     je      .create_ipv6
     call    IcmpCreateFile
@@ -1014,6 +1077,10 @@ main:
     mov     byte [rel g_ctrl], 1
 
     ; ---- payload pattern ----
+    ; Fill exactly g_size bytes with the low byte of the descending remaining
+    ; count. The payload is arbitrary binary echo data; a zero-length payload
+    ; skips the loop and is valid. No packet/checksum construction is needed:
+    ; Windows builds the ICMP/IP headers for these APIs.
     lea     rdi, [rel sendbuf]
     mov     ecx, [rel g_size]
 .fill:
@@ -1045,13 +1112,14 @@ main:
 .no_df:
     cmp     qword [rel g_rr], 0
     je      .no_rr
+    ; IPv4 Record Route is a type/length/pointer option: type 7, length 3+4*N,
+    ; initial next-write pointer 4 (one-based). Its address slots start zeroed.
+    ; Round the enclosing IP options size up to a 4-byte boundary; the padding
+    ; remains zero (end-of-options). N <= 9 keeps the total within 40 bytes.
+    ; The option's own length remains 3 + 4*N; only the enclosing size is padded.
     mov     rax, [rel g_rr]
     lea     rcx, [rel routedata]
     mov     byte [rcx], 7
-    ; Record Route is a type/length/pointer option followed by four bytes per
-    ; requested hop. Its next-write pointer is 1-based, so the first slot is 4.
-    ; Round the overall options area to a multiple of four bytes; BSS supplies
-    ; zero padding. The option's own length remains 3 + 4 * hop_count.
     lea     edx, [rax*4+3]
     mov     [rcx+1], dl
     mov     byte [rcx+2], 4
@@ -1077,6 +1145,9 @@ main:
 .opt_done:
 
     ; ---- ping table header (pretty) ----
+    ; row_cells contains pointers, while g_colw points to byte widths. The same
+    ; print_row/print_border helpers later draw data, errors, routes, and stats
+    ; by changing this state rather than implementing separate table printers.
     cmp     byte [rel g_quiet], 0
     jne     .tbl_done
     cmp     byte [rel g_pretty], 0
@@ -1113,6 +1184,8 @@ main:
     ; Count a probe as sent before submitting it. Only a successful ICMP status
     ; increments received; an interrupted pending request therefore counts lost.
     ; The loop serializes probes even in flood mode, so buffers may be reused.
+    ; Check stop/count before sending and after rendering to avoid a final wait.
+    ; -t bypasses the count check; --flood bypasses only the pacing wait.
     xor     r14d, r14d                 ; sent
     xor     r15d, r15d                 ; received
 .loop:
@@ -1123,6 +1196,8 @@ main:
     cmp     r14, [rel g_count]
     jae     .stats
 .do_ping:
+    ; The monotonic start tick is used for start-to-start pacing, independently
+    ; of the RTT measured by Windows. Reset the completion event before launch.
     call    GetTickCount64
     mov     [rel g_started], rax
     mov     rcx, [rel g_reply_event]
@@ -1139,14 +1214,16 @@ main:
     je      .send_ipv6
     cmp     byte [rel g_has_source], 0
     jne     .send_ipv4_source
+    ; IcmpSendEcho2(handle, event, NULL APC, NULL context,
+    ;   destination, payload, size, options, reply, capacity, timeout).
+    ; The first four arguments are registers; outgoing slots +20h..+50h hold
+    ; arguments 5..11. A non-NULL event requests asynchronous completion.
+    ; Slots are eight bytes even when the API consumes a WORD or DWORD argument.
     mov     rcx, rbx
     mov     rdx, [rel g_reply_event]
     xor     r8d, r8d
     xor     r9d, r9d
     mov     [rsp+20h], r12
-    ; IcmpSendEcho2 arguments 5..11: destination, payload pointer/size,
-    ; options pointer, reply pointer/capacity, timeout. All stack slots are
-    ; eight bytes even when the API consumes a WORD or DWORD argument.
     lea     rax, [rel sendbuf]
     mov     [rsp+28h], rax
     mov     rax, [rel g_size]
@@ -1161,9 +1238,9 @@ main:
     call    IcmpSendEcho2
     jmp     .send_result
 .send_ipv4_source:
-    ; The Ex variant inserts a source IPv4 address before the destination;
-    ; every later stack argument shifts one slot. The address bytes are already
-    ; in network order in sockaddr_in, so copying the DWORD needs no BSWAP.
+    ; IcmpSendEcho2Ex inserts SourceAddress before DestinationAddress. That
+    ; shifts the payload and later arguments by one slot; timeout is arg 12 at
+    ; +58h. Pass the DWORD address bytes unchanged in Windows IPAddr form.
     mov     rcx, rbx
     mov     rdx, [rel g_reply_event]
     xor     r8d, r8d
@@ -1197,6 +1274,9 @@ main:
 .send_ipv6:
     ; IPv6 asynchronous ICMP ignores Timeout according to its API contract.
     ; A synchronous worker honors it while the main thread can wait for Ctrl+C.
+    ; Reset its result/error slots before launch and mark resources as pending
+    ; before the worker can access them. Closing the thread HANDLE merely drops
+    ; our reference; completion is communicated through g_reply_event instead.
     lea     rdi, [rel reply6buf]
     xor     eax, eax
     mov     ecx, 5
@@ -1216,10 +1296,11 @@ main:
     mov     rcx, rax              ; closing this handle does not stop the worker
     call    CloseHandle
 .wait_reply:
-    ; Wait for either event, not both. With wait-any, the return value is the
-    ; signaled handle's index (0 = stop, 1 = reply). Stop is first so simultaneous
-    ; completion/interruption prefers stopping. The ICMP operation supplies its
-    ; own timeout; this wait can remain infinite and still wake on Ctrl+C.
+    ; Wait for either event, with no main-thread timeout: the ICMP API/worker
+    ; supplies the request timeout. With wait-all FALSE, result 0 means stop,
+    ; 1 means reply. If both are signaled, the lowest array index (stop) wins.
+    ; A reply wake clears g_pending, permitting normal resource closure; a stop
+    ; wake leaves it set because the request may still own those resources.
     mov     ecx, 2
     lea     rdx, [rel g_stop_event]
     xor     r8d, r8d
@@ -1233,6 +1314,8 @@ main:
     cmp     dword [rel g_family], AF_INET6
     je      .ipv6_completed
     lea     rcx, [rel replybuf]
+    ; The signaled IPv4 buffer must be parsed before reading its reply header.
+    ; IPv6's synchronous worker has already returned a native reply/result.
     mov     edx, REPLY_CAP
     call    IcmpParseReplies
     test    eax, eax
@@ -1249,13 +1332,17 @@ main:
     mov     eax, [rel g_worker_error]
     jmp     .fail_code
 .got_reply:
-    ; Receiving an ICMP error response is not a successful echo. Normalize the
-    ; two API layouts, then count a reply only when its IP_STATUS is zero.
+    ; An API-level completion can still contain a nonzero ICMP status, such as
+    ; TTL expiry. Normalize the responder so errors can name the router/address
+    ; that sent them, then count a successful echo only when IP_STATUS is zero.
     call    normalize_reply
     cmp     dword [rel replybuf+4], 0
     jne     .reply_err
 
     ; ---- success ----
+    ; RTT is an unsigned DWORD in milliseconds. Zero renders as "<1ms" but is
+    ; still a zero sample in min/max/sum. Update stats even when --quiet hides
+    ; the result. Later averaging adds half the count for nearest-ms rounding.
     inc     r15
     mov     eax, [rel replybuf+8]
     mov     ecx, [rel g_min]
@@ -1342,6 +1429,9 @@ main:
     call    print_color
     jmp     .route
 .row_plain:
+    ; Reuse the cached display name only if -a was requested and this responder
+    ; matches the resolved destination. Other responders keep their numeric
+    ; address; no reverse DNS lookup is performed inside the probe loop.
     call    print_timestamp
     lea     rcx, [rel s_reply]
     call    print_sz
@@ -1393,12 +1483,18 @@ main:
     call    print_sz
     ; fall into route
 .route:
+    ; Route decoding is IPv4-only because -r was rejected for IPv6 during setup.
+    ; The --quiet branch above bypasses both the success row and route details.
     cmp     qword [rel g_rr], 0
     je      .after
     call    print_route
     jmp     .after
 
     ; ---- failure ----
+    ; API failures arrive through GetLastError; ICMP error replies carry their
+    ; status in replybuf+4. Both paths build errbuf, with a responder prefix only
+    ; for an actual reply. The stack cursor and saved code are used only while
+    ; formatting; they reuse slots that previously held outgoing API arguments.
 .fail:
     call    GetLastError
 .fail_code:
@@ -1422,9 +1518,12 @@ main:
     mov     [rsp+40h], rax
     mov     eax, [rel replybuf+4]
 .map_code:                          ; eax = error code, errbuf cursor at [rsp+40h]
-    ; Both API failures and ICMP error replies reach this mapping. Known codes
-    ; get readable messages; an unknown code retains its numeric value. IPv4
-    ; and IPv6 share some status numbers but use different user-facing wording.
+    ; Both API failures and ICMP error replies reach this mapping. Some codes
+    ; share a value across IPv4/IPv6 but need family-specific wording:
+    ; 11010 timeout; 11002..11005/11040 unreachable; 11013/11014/11041 TTL or
+    ; hop-limit expiry; 11045 scope mismatch; 11050 general failure;
+    ; 11009 packet too big/fragmentation required. Unknown codes keep their
+    ; numeric value in "Transmit failed, error N".
     mov     [rsp+38h], eax
     lea     r13, [rel m_fail]
     cmp     eax, 11010
@@ -1487,6 +1586,9 @@ main:
     mov     eax, [rsp+38h]
     call    append_dec
 .emit_err:
+    ; An error remains a lost attempt: R14 was incremented, R15 was not. Quiet
+    ; mode suppresses the message without altering that accounting. Table mode
+    ; temporarily uses one wide column, then restores the five-column layout.
     cmp     byte [rel g_quiet], 0
     jne     .after
     cmp     byte [rel g_pretty], 0
@@ -1541,6 +1643,7 @@ main:
     ; Both renderers use the same counters. Loss is sent-received; RTT values
     ; cover successful replies only. Skip division by received when it is zero.
     ; The average uses (sum + received/2) / received for integer rounding.
+    ; loss_percent keeps the multiplication exact using a 128-bit intermediate.
 .stats:
     cmp     byte [rel g_pretty], 0
     je      .stats_plain
@@ -1654,6 +1757,7 @@ main:
     lea     rdi, [rel valbuf]
     mov     rax, [rel g_sum]
     mov     rcx, r15
+    ; floor((sum + floor(received/2)) / received), rounding half milliseconds up.
     shr     rcx, 1
     add     rax, rcx
     xor     edx, edx
@@ -1667,6 +1771,8 @@ main:
     call    stat_row
     jmp     .times_done_p
 .no_times_p:
+    ; With no successes g_min is still its sentinel; display '-' instead of
+    ; misleading RTT values, and never divide by a zero received count.
     lea     rcx, [rel s_m_min]
     lea     rdx, [rel s_dash]
     call    stat_row
@@ -1736,6 +1842,8 @@ main:
     call    print_sz
 .no_times:
 .stats_done:
+    ; Any successful reply yields exit 0; none yields exit 1. Setup/usage errors
+    ; use exit 2. A failed stdout write overrides any of these to exit 2 below.
     test    r15, r15
     jz      .exit1
     jmp     .exit0
@@ -1786,6 +1894,8 @@ main:
     jz      .close_wsa
     call    CloseHandle
 .close_wsa:
+    ; The pending-request case still frees argv, balances Winsock setup, and
+    ; restores console attributes. Only the request-owned handles are retained.
     cmp     byte [rel g_wsa], 0
     je      .free_args
     call    WSACleanup
@@ -1819,6 +1929,10 @@ main:
 ; Publish both fields before signaling g_reply_event; main reads them after its
 ; wait completes. Do not reuse or free the buffers while this worker is pending.
 ipv6_worker:
+    ; Icmp6SendEcho2(handle, NULL event, NULL APC, NULL context,
+    ;   source sockaddr_in6*, destination sockaddr_in6*, payload, size,
+    ;   options, reply, capacity, timeout). NULL event/APC selects synchronous
+    ; operation. The 68h frame aligns calls and covers arguments 5..12.
     sub     rsp, 68h
     mov     rcx, [rel g_icmp]
     xor     edx, edx              ; synchronous: Timeout is honored by Windows
@@ -1856,11 +1970,18 @@ ipv6_worker:
 ; Normalize the native IPv6 header into the common status/RTT/size fields.
 ; IPv6 exposes neither reply size nor received hop limit; use request size and
 ; omit TTL in the renderer. Keep the IPv4 options header intact for record route.
-; Input/output: static reply buffers -> reply_addr/reply_ipstr and the common
+;
+; Native x64 ICMP_ECHO_REPLY offsets used throughout this file (40 bytes):
+;   +0 DWORD Address, +4 DWORD Status, +8 DWORD RoundTripTime,
+;   +12 WORD DataSize, +14 WORD Reserved, +16 pointer Data,
+;   +24 IP_OPTION_INFORMATION (TTL +24, OptionsSize +27, OptionsData +32).
+; Native ICMPV6_ECHO_REPLY: IPV6_ADDRESS_EX at +0 (port +0, flow +2,
+;   16 address bytes +6, scope +22), Status +28, RoundTripTime +32.
+; reply_addr is a separate sockaddr: family +0; IPv4 address +4; IPv6 address
+;   +8 and host-order scope +24. Do not copy a native IPv6 reply as a sockaddr.
+; Input/output: static reply buffers -> reply_addr/reply_ipstr and common
 ; replybuf status/RTT/size fields. RSI/RDI are scratch under our internal contract.
-; The IPv6 API layout is different from sockaddr_in6: address bytes start at +6,
-; scope at +22, status at +28, RTT at +32. Copy fields rather than casting the
-; entire reply. BSWAP converts its network-order scope to sockaddr's host order.
+; BSWAP converts the reply's network-order scope to sockaddr's host order.
 normalize_reply:
     sub     rsp, 28h
     lea     rdi, [rel reply_addr]
@@ -1892,6 +2013,8 @@ normalize_reply:
     cmp     ecx, [rel dest_addr+24]
     sete    byte [rel g_reply_is_target]
 .ipv6_fields:
+    ; Populate just the common scalar fields used by stats/rendering. The IPv4
+    ; options area remains untouched, and IPv6 rendering never reads its TTL.
     mov     eax, [rel reply6buf+28]
     mov     [rel replybuf+4], eax
     mov     eax, [rel reply6buf+32]
@@ -1899,6 +2022,8 @@ normalize_reply:
     mov     eax, [rel g_size]
     mov     [rel replybuf+12], ax
 .format:
+    ; Numeric-only getnameinfo formatting understands both sockaddr families.
+    ; On failure, write the two bytes '-' and NUL as a minimal display fallback.
     lea     rcx, [rel reply_addr]
     lea     rdx, [rel reply_ipstr]
     mov     r8d, 64
@@ -1931,8 +2056,9 @@ ctrl_handler:
 
 ; ---------- token / parse helpers ----------
 
-; Compare both strings through their terminating zero, so prefixes do not match.
-; RCX/RDX stay unchanged; R8 is an index and RAX holds the comparison/result.
+; Compare two NUL-terminated byte strings, including the final terminator. Used
+; for long options, so no case folding or prefix match is allowed. Clobbers R8
+; and RAX, preserving the input pointers so callers can try another option name.
 option_equal:                      ; rcx/rdx = strings, eax = bool; preserves pointers
     xor     r8d, r8d
 .compare:
@@ -1950,10 +2076,12 @@ option_equal:                      ; rcx/rdx = strings, eax = bool; preserves po
     xor     eax, eax
     ret
 
-; g_argidx advances once per argument. A returned pointer refers to tokenbuf,
-; which the next call overwrites; callers must copy any text they need to keep.
-; A null result means exhaustion OR conversion failure. g_argerror distinguishes
-; those cases. WideCharToMultiByte's -1 input length includes the terminal zero.
+; Convert argv[g_argidx] from UTF-16 to UTF-8, then advance the index. Passing
+; cchWideChar=-1 includes the NUL terminator. WideCharToMultiByte arguments 5..8
+; are output buffer, byte capacity, NULL default char, and NULL used-default flag.
+; Returns a pointer to reusable tokenbuf, or NULL for exhaustion/conversion error.
+; g_argerror distinguishes those two NULL cases. Uses volatile registers only.
+; The next call overwrites tokenbuf, so copy any returned text needed later.
 next_token:                         ; next Windows argv entry -> tokenbuf or 0
     sub     rsp, 48h
     mov     eax, [rel g_argidx]
@@ -1983,9 +2111,9 @@ next_token:                         ; next Windows argv entry -> tokenbuf or 0
     add     rsp, 48h
     ret
 
-; Skip the two-byte option prefix: "-n4" returns a pointer to "4". For "-n", a
-; tail JMP reuses our caller's return address so next_token returns directly to
-; it. No new stack frame is needed on either path.
+; Short numeric/source options consume either the suffix after the two-byte
+; switch (-n4, -S::1), or a whole following argv entry (-n 4). The tail jump
+; lets next_token return directly to get_val's caller using the same return slot.
 get_val:                            ; rcx = option token -> rax = value ptr or 0
     cmp     byte [rcx+2], 0
     jne     .inline
@@ -1999,6 +2127,7 @@ get_val:                            ; rcx = option token -> rax = value ptr or 0
 ; at that boundary only final digits 0..5 fit. The guards avoid wraparound.
 ; RCX advances and R8 counts digits. EDX is a second return value (0 valid,
 ; 1 invalid), not an ABI-preserved register; the caller must check it immediately.
+; The caller separately applies each option's allowed range.
 parse_u32:                          ; rcx = asciiz -> rax = value, edx = 0/1
     xor     eax, eax
     xor     r8d, r8d
@@ -2029,10 +2158,12 @@ parse_u32:                          ; rcx = asciiz -> rax = value, edx = 0/1
     mov     edx, 1
     ret
 
-; Standalone dotted-decimal example, currently unused by the main resolver.
-; Require four nonempty octets in 0..255 and exact dot/zero separators. Building
-; octets with *256 gives a numeric big-endian value; BSWAP arranges EDX so storing
-; it on little-endian x64 yields network-order bytes. RSI advances during parsing.
+; Standalone dotted-quad helper; endpoint setup currently uses getaddrinfo in
+; net_resolve.asm instead. Requires exactly four nonempty decimal octets, each
+; <=255, separated by dots and followed immediately by NUL. Leading zeros are
+; decimal here. Advances RSI; clobbers volatile registers. EDX is valid only
+; when EAX=1. Build octets numerically, then BSWAP so storing EDX gives network
+; byte order in little-endian memory (e.g. 127.0.0.1 -> bytes 7f 00 00 01).
 parse_ip4:                          ; rsi = asciiz -> rax = 1, edx = ip / rax = 0
     xor     edx, edx
     mov     r8d, 4
@@ -2079,7 +2210,8 @@ parse_ip4:                          ; rsi = asciiz -> rax = 1, edx = ip / rax = 
 ; RSI = source, RDI = destination with at least 256 bytes available. Copy at most
 ; 255 printable ASCII bytes, replace control/non-ASCII bytes with '?', then write
 ; a zero. This bounds resolver-provided names and prevents terminal escape text.
-; Return RAX = RDI pointing at the zero; RSI/RDI advance. No heap allocation.
+; Return RAX = RDI pointing at the zero; RSI/RDI advance and ECX is scratch.
+; No heap allocation is needed.
 append_name:                        ; bounded/sanitized display name -> 256 bytes
     mov     ecx, 255
 .loop:
@@ -2103,9 +2235,12 @@ append_name:                        ; bounded/sanitized display name -> 256 byte
     mov     rax, rdi
     ret
 
-; Copy through the terminal zero, leaving RDI on it so the next append overwrites
-; that zero. There is no capacity argument: callers must provide enough room for
-; all fragments. Use append_name first for externally supplied display names.
+; Copy through the source NUL, leaving RDI/RAX at the destination terminator.
+; The next append overwrites that NUL. This helper performs no capacity check:
+; callers must use bounded names/numbers and sufficiently large static buffers.
+; Advances RSI/RDI and clobbers RAX; source and destination must be suitable
+; for forward copying (it is not a general overlapping-memory move).
+; Use append_name first for externally supplied display names.
 append_str:                         ; rdi = cursor, rsi = asciiz -> rax = new cursor
 .l:
     movzx   eax, byte [rsi]
@@ -2125,6 +2260,7 @@ append_str:                         ; rdi = cursor, rsi = asciiz -> rax = new cu
 ; runs once even for zero. A uint64 needs at most 20 decimal digits.
 ; This primitive does NOT append a zero; append_dec adds one. RAX/RDX/R8/R10/R11
 ; are scratch and RDI advances. The shared numbuf makes this helper non-reentrant.
+; RSI and RCX are preserved; print_dec also adds a terminator before output.
 dec_to_buf:                         ; rax = uint64, rdi = cursor -> rdi advanced
     mov     r8, rax
     lea     r10, [rel numbuf+31]
@@ -2149,8 +2285,9 @@ dec_to_buf:                         ; rax = uint64, rdi = cursor -> rdi advanced
     jb      .cp
     ret
 
-; String-building wrapper: reserve call space, emit digits, terminate the result,
-; and return the cursor just as append_str does. Caller supplies the capacity.
+; NUL-terminated wrapper around dec_to_buf for chained string construction.
+; RDI and returned RAX both point to the new terminating NUL; capacity is the
+; caller's responsibility. The stack frame supplies shadow space/alignment.
 append_dec:                         ; rdi = cursor, rax = value -> rax = new cursor
     sub     rsp, 28h
     call    dec_to_buf
@@ -2159,9 +2296,10 @@ append_dec:                         ; rdi = cursor, rax = value -> rax = new cur
     add     rsp, 28h
     ret
 
-; Format four bytes in memory order, inserting dots between octets. No byte swap
-; is needed when reading individual network-order bytes. Destination needs up to
-; 16 bytes including the zero; the loop index lives beyond the callee shadow area.
+; Format four network-order address bytes as dotted decimal (max 15 chars plus
+; NUL). Reading each byte avoids host-endian shifts. Used for Record Route slots.
+; Advances RSI/RDI; stores the octet counter in a stack local beyond shadow
+; space because the decimal converter uses volatile arithmetic registers.
 ip_str:                             ; rsi = 4 addr bytes, rdi = dest -> rax = cursor
     sub     rsp, 28h
     mov     dword [rsp+20h], 0
@@ -2183,10 +2321,12 @@ ip_str:                             ; rsi = 4 addr bytes, rdi = dest -> rax = cu
 
 ; ---------- console output helpers ----------
 
-; Fill only the digit positions in timestamp_text; separators and final zero
-; already exist. SYSTEMTIME's +4 field is day-of-week, so day-of-month comes from
-; +6. GetSystemTime is UTC, while GetTickCount64 elsewhere measures elapsed time.
-; No output when timestamps are disabled. RSI/RDI follow our scratch convention.
+; Optional per-probe prefix. GetSystemTime returns UTC, not local time, as eight
+; WORDs: year, month, weekday, day, hour, minute, second, milliseconds. Skip the
+; weekday field and overwrite only the digit positions in the static template;
+; punctuation and NUL stay in place. Clobbers RDI and volatile registers.
+; Day-of-month is at +6, after the weekday at +4. GetTickCount64 elsewhere
+; measures elapsed time rather than UTC wall-clock time.
 print_timestamp:
     cmp     byte [rel g_timestamp], 0
     je      .done
@@ -2227,9 +2367,10 @@ print_timestamp:
 .done:
     ret
 
-; Write exactly width digits from right to left, including leading zeroes. The
-; caller guarantees a positive width and a fitting value; excess high digits
-; would be discarded. RDI stays at the field start; EAX/ECX/EDX/R9 are scratch.
+; Write exactly width zero-padded decimal digits, right to left. Callers supply
+; field values/widths that fit the timestamp template. Does not add a NUL or
+; advance RDI; consumes EAX/ECX and clobbers EDX/R9.
+; Width must be positive; any high digits beyond that width would be discarded.
 fixed_digits:                       ; eax=value, ecx=width, rdi=destination
     mov     r9d, 10
 .digit:
@@ -2246,6 +2387,7 @@ fixed_digits:                       ; eax=value, ecx=width, rdi=destination
 ; MUL keeps the full product in RDX:RAX and DIV consumes that 128-bit numerator.
 ; Do not clear RDX between these instructions: it contains the product's high
 ; half. With received <= sent, the quotient fits and is always in 0..100.
+; Preserve R14/R15 and the formatting cursor RDI; clobber RAX/RCX/RDX.
 loss_percent:                      ; sent=r14, received=r15; zero-safe uint64 math
     xor     eax, eax
     test    r14, r14
@@ -2258,11 +2400,13 @@ loss_percent:                      ; sent=r14, received=r15; zero-safe uint64 ma
 .done:
     ret
 
-; Decode optional IPv4 Record Route data from replybuf. Treat all returned
-; lengths/pointers as untrusted: the options span must fit inside REPLY_CAP,
-; each type-length-value entry must fit inside that span, and route slots must
-; be complete four-byte addresses. EOL and NOP are special one-byte options.
-; Save R13/R14 because the caller uses them for state, particularly sent count.
+; Decode an IPv4 options area supplied by Windows. Before dereferencing it,
+; require OptionsSize <=40 and the whole range to lie inside replybuf beyond
+; its native 40-byte header. Then walk bounded type/length/value options:
+; type 0 ends the list, type 1 is a one-byte NOP, type 7 is Record Route.
+; Malformed pointers, lengths, or route write positions stop decoding quietly.
+; Preserve R13/R14 because main keeps its sent counter in R14; other formatting
+; helpers may advance RSI/RDI. The function does not alter packet statistics.
 print_route:
     push    r13
     push    r14
@@ -2306,6 +2450,9 @@ print_route:
     inc     r10
     jmp     .option
 .rr:
+    ; The RR pointer is one-based and points to the next address slot. Subtract
+    ; 4 and divide by 4 for the count already written. Check alignment and the
+    ; option length before displaying at most nine complete IPv4 addresses.
     cmp     ecx, 3
     jb      .done
     movzx   eax, byte [r10+2]       ; 1-based next-write pointer
@@ -2341,6 +2488,8 @@ print_route:
     je      .address
     cmp     dword [rsp+20h], 4
     jb      .address
+    ; Four full dotted-quads fit in the 78-column span with the " route:" label.
+    ; Flush here only for tables; plain output can contain all nine on one line.
     call    route_row              ; wrap complete addresses, never hide hops
     mov     dword [rsp+20h], 0
     lea     rdi, [rel errbuf]
@@ -2363,8 +2512,9 @@ print_route:
     pop     r13
     ret
 
-; Render errbuf using one full-width cell, then restore the normal five-column
-; reply layout. Called when a route needs a new line or has no more addresses.
+; Render errbuf as one full-width table row, then restore the main five-column
+; layout so the following probe/border uses its normal columns. Callers build
+; the complete route fragment before invoking this helper.
 route_row:
     sub     rsp, 28h
     lea     rax, [rel colw_span]
@@ -2379,8 +2529,9 @@ route_row:
     add     rsp, 28h
     ret
 
-; Convert a zero-terminated string to WriteFile's (pointer, byte count) contract.
-; strlen8 preserves RCX, so the original pointer is still available for output.
+; Print a NUL-terminated string by converting its length to an explicit byte
+; count. strlen8 preserves RCX; ws_print_raw handles short writes and failures.
+; This wrapper may clobber volatile registers, but does not advance RSI/RDI.
 print_sz:                           ; rcx = asciiz
     sub     rsp, 28h
     call    strlen8
@@ -2389,8 +2540,10 @@ print_sz:                           ; rcx = asciiz
     add     rsp, 28h
     ret
 
-; RCX points to a valid zero-terminated byte string; RAX returns its byte length
-; excluding the terminator. No capacity check or Unicode character counting.
+; RCX -> readable NUL-terminated bytes; RAX <- length excluding NUL. No bounds
+; check: callers supply known literals or buffers terminated by format helpers.
+; Only RAX and flags change, allowing print_sz to reuse the original RCX.
+; The result counts bytes, not Unicode characters or display columns.
 strlen8:
     xor     rax, rax
 .scan:
@@ -2401,11 +2554,15 @@ strlen8:
 .found:
     ret
 
-; WriteFile may successfully write fewer bytes than requested. Keep the remaining
-; pointer/length on our stack, advance by the actual DWORD count, and retry.
-; A failed or zero-progress write latches g_output_error and stops probing; trying
-; to report that failure through this same output stream would risk recursion.
-; A zero length is a no-op. All callers here use lengths that fit in a DWORD.
+; Write exactly length bytes unless stdout fails. Keep the remaining pointer
+; and length in stack locals because WriteFile may overwrite volatile registers.
+; WriteFile(handle, buffer, DWORD count, &written, NULL overlapped) is synchronous;
+; the zero overlapped pointer is arg 5 at +20h. All caller lengths fit a DWORD.
+; A short successful write advances the cursor and retries; zero progress also
+; counts as failure to avoid an infinite loop. The error is sticky: suppress
+; future writes, set g_stop, and let final cleanup force exit code 2.
+; Zero length is a no-op. Avoid reporting write errors through this same stream,
+; which would risk recursive failures.
 ws_print_raw:                       ; rcx = buffer, rdx = length
     sub     rsp, 48h
     mov     [rsp+28h], rcx
@@ -2436,8 +2593,10 @@ ws_print_raw:                       ; rcx = buffer, rdx = length
     add     rsp, 48h
     ret
 
-; Format into numbuf and emit the exact produced length (RDI - buffer start).
-; This prints without a newline and overwrites the shared formatting scratch.
+; Format an unsigned integer into numbuf, terminate it, and print the explicit
+; byte range. dec_to_buf uses the end of that same buffer as scratch; at most
+; twenty digits fit safely during its forward copy. Clobbers RDI/volatile regs.
+; The byte count is RDI - buffer start; no newline is added.
 print_dec:                          ; rax = unsigned value
     sub     rsp, 28h
     lea     rdi, [rel numbuf]
@@ -2485,16 +2644,19 @@ print_color:                        ; rax = color index
 .done:
     ret
 
+; Print the selected glyph string for a valid B_* index. Pointer tables make
+; its byte length independent of its display width (one console column).
 print_charset:                      ; rax = box charset index
     lea     r10, [rel boxset]
     mov     rcx, [r10 + rax*8]
     jmp     print_sz
 
 ; print_cell: rcx = string, rdx = cell width (prints " " + content + padding)
-; Reserve two spaces within the width. If content is too long, keep a prefix and
-; add "..." when at least three content positions fit. Caller widths are >= 2.
-; This counts bytes, which equals columns for our sanitized ASCII cell content;
-; it is not a general Unicode display-width algorithm.
+; Width includes one leading and one trailing space. If content exceeds width-2,
+; reserve three bytes for "..." when possible, then pad to the exact cell width.
+; Content is ASCII (sanitized names, numeric addresses, labels), so byte count
+; equals display columns; UTF-8 box glyphs are printed outside cells. Layouts
+; guarantee width >=2. Stack locals preserve state across output helper calls.
 print_cell:
     sub     rsp, 48h
     mov     [rsp+20h], rcx          ; content
@@ -2541,8 +2703,9 @@ print_cell:
     ret
 
 ; print_row: prints one table row from row_cells[0..g_ncols), g_colw layout
-; row_cells is an array of pointers; g_colw points to one-byte widths. Keep the
-; loop index in our frame because nested formatting/API calls use volatile regs.
+; Start with a vertical border, then print each cell and another border, ending
+; with CRLF. g_colw entries are bytes; row_cells entries are 8-byte pointers.
+; Keep the column index outside the shadow area so nested calls cannot lose it.
 print_row:
     sub     rsp, 48h
     mov     rax, B_V
@@ -2568,8 +2731,9 @@ print_row:
     ret
 
 ; print_border: eax = left idx, edx = mid idx, ecx = right idx
-; Draw one horizontal run per column. Use middle junctions only between columns,
-; then the right corner. Saved indices/counts survive print_charset's nested calls.
+; Use the current column widths to repeat horizontal glyphs, inserting a middle
+; junction between columns and a right corner at the end. All indices/counts
+; needed after print calls are saved in locals rather than volatile registers.
 print_border:
     sub     rsp, 58h
     mov     [rsp+28h], rax
@@ -2611,8 +2775,9 @@ print_border:
     ret
 
 ; box_hline: eax = left idx, edx = right idx, ecx = total width
-; A single-span border: two corners plus width-2 horizontal glyphs. Its caller
-; supplies a width >= 2; this helper does not use the current column layout.
+; Draw a single unpartitioned border: left + (width-2) horizontals + right + CRLF.
+; Used for title/configuration boxes, independently of the active table layout.
+; The caller supplies a width >= 2.
 box_hline:
     sub     rsp, 38h
     mov     [rsp+20h], rcx          ; width
@@ -2637,8 +2802,8 @@ box_hline:
     ret
 
 ; box_line: rcx = content, edx = total box width
-; The outer vertical borders consume two columns; print_cell pads/truncates the
-; remaining interior. This reuses the same cell renderer as ordinary table rows.
+; The two outer vertical borders consume two columns; print_cell gets the
+; remaining width and supplies its own spaces, clipping, and padding.
 box_line:
     sub     rsp, 38h
     mov     [rsp+20h], rcx
@@ -2657,8 +2822,8 @@ box_line:
     ret
 
 ; stat_row: rcx = label, rdx = value string
-; The caller has already selected colw_stats and g_ncols=2. Bind the two cells,
-; then let print_row handle borders, spacing and the newline.
+; The statistics caller has selected colw_stats and two columns. Store the two
+; pointers and delegate to print_row; strings remain valid for that whole call.
 stat_row:
     sub     rsp, 28h
     mov     [rel row_cells], rcx
@@ -2667,6 +2832,8 @@ stat_row:
     add     rsp, 28h
     ret
 
-; Textual inclusion resumes .bss/.text sections in the resolver. It is assembled
-; once as part of this file, not linked as a separately assembled module.
+; Textual inclusion assembles the resolver into this same object. It contributes
+; Winsock imports, source/destination sockaddr storage, family selection, scope
+; validation, resolve_endpoints, and format_address. It is not linked separately.
+; Its .bss/.text directives resume the sections already used above.
 %include "net_resolve.asm"
